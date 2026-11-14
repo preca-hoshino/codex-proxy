@@ -1,0 +1,8 @@
+/target/
+/config.toml
+/accounts.json
+/*.lockfile
+*.tmp
+/docs/
+/reports/
+/scripts/

@@ -1,0 +1,19 @@
+[server]
+host = "127.0.0.1"
+port = 8318
+accounts_file = "accounts.json"
+upstream_transport = "wss" # wss or http; applies to connections to ChatGPT
+auto_prompt_cache = true # derive a stable cache key when the client does not supply one
+# proxy = "http://127.0.0.1:7890"
+# api_key = "replace-with-a-long-random-key"
+
+[rotation]
+strategy = "round_robin" # round_robin or priority
+cooldown_ms = 60000
+
+[retry]
+max_attempts = 5
+timeout_ms = 300000
+
+[quota]
+refresh_interval_ms = 300000
