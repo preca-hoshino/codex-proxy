@@ -4,17 +4,14 @@ Codex Proxy 是一个使用 Rust 编写的个人多账号代理，将 Codex 上�
 
 ## 架构与支持协议
 
-- **OpenAI 兼容端点**：`/v1/chat/completions`、`/v1/responses`、`/v1/models`；支持流式与非流式请求。
-- **上游连接**：默认使用 WSS，可切换为 HTTP SSE；本地客户端始终使用 HTTP。
+- **OpenAI 兼容接口**：支持 `/v1/chat/completions`、`/v1/responses` 和 `/v1/models`，支持流式与非流式请求。
+- **上游连接**：支持 WSS 和 HTTP SSE，默认使用 WSS。
 - **账号管理**：支持 OAuth 登录、账号轮换、配额查询和失败重试。
-- **模型与推理**：模型目录来自上游；`ultra` 推理档位根据所选账号的模型目录解析。
-- **状态与日志**：`/healthz` 健康检查；发送请求时记录模型、实际思考档位（未指定时为 `default`）、账号、传输方式和重试次数，完成后输出 `[METRICS]`，定时刷新配额并输出 `[QUOTA]`。
+- **状态监控**：提供 `/healthz` 健康检查和请求、配额日志。
 
-请求在上游调用前被本地校验拒绝时，`[REJECTED]` 会记录安全的原因类别；由于没有上游用量，相关 `[METRICS]` 显示 `unknown`。
+代理会清理 Codex 不支持的请求参数，暂不支持 `previous_response_id`；流式响应开始后不会透明重试。
 
-代理会清理 Codex 不支持的请求参数；暂不支持 `previous_response_id`，流式响应开始后不会透明重试。
-
-Chat 和 Responses 请求支持 `prompt_cache_key`，并将其同步为上游 `session-id`。客户端未提供键时，代理默认优先按会话请求头、否则按模型和首条用户消息生成稳定哈希；设置 `server.auto_prompt_cache = false` 可关闭自动生成。相同首条消息可能共享路由标识；缓存命中仍取决于账号、上游和相同的长输入前缀。
+Chat 和 Responses 请求支持 `prompt_cache_key`，默认自动生成，也可通过 `server.auto_prompt_cache = false` 关闭自动生成。缓存命中取决于账号、上游和相同的长输入前缀。
 
 ## 构建与运行
 
@@ -71,14 +68,6 @@ Windows 编译产物位于 `target\release\codex-proxy.exe`。也可从 [Release
 ## 致谢
 
 模块划分和功能参考 [Antigravity Proxy](https://github.com/preca-hoshino/antigravity-proxy)；Codex 认证、上游协议与 Chat 转换参考 [zyycn/codex-proxy-rs](https://github.com/zyycn/codex-proxy-rs)（Apache-2.0）。
-
-## 持续集成与发布
-
-推送到 `main` 或手动运行工作流时，GitHub Actions 会运行测试、构建 Windows x64 和 ARM64 程序，并为构建产物生成来源证明和发布 Release。可使用 GitHub CLI 验证下载的程序：
-
-```powershell
-gh attestation verify codex-proxy.exe --repo preca-hoshino/codex-proxy
-```
 
 ## 许可证
 
