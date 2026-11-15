@@ -196,8 +196,19 @@ pub async fn connect(
     account_id: Option<&str>,
     proxy: Option<&str>,
     session_id: Option<&str>,
+    wire_id: u64,
+    redact_secrets: bool,
 ) -> Result<UpstreamSocket, ConnectionError> {
-    connect_to(WS_URL, access_token, account_id, proxy, session_id).await
+    connect_to(
+        WS_URL,
+        access_token,
+        account_id,
+        proxy,
+        session_id,
+        wire_id,
+        redact_secrets,
+    )
+    .await
 }
 
 /// Injects a WebSocket address for local protocol tests; the application must use `connect` in production.
@@ -207,6 +218,8 @@ pub async fn connect_to(
     account_id: Option<&str>,
     proxy: Option<&str>,
     session_id: Option<&str>,
+    wire_id: u64,
+    redact_secrets: bool,
 ) -> Result<UpstreamSocket, ConnectionError> {
     if access_token.is_empty() {
         return Err("access token is empty".into());
@@ -233,8 +246,20 @@ pub async fn connect_to(
         account_id,
         session_id,
     )?;
+    if crate::logger::wire_debug_enabled() {
+        let proxy_note = proxy
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| crate::logger::redact_proxy_url(p, redact_secrets))
+            .unwrap_or_else(|| "direct".into());
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_WSS -> HANDSHAKE {endpoint} via={proxy_note} headers={}",
+            crate::logger::format_tungstenite_headers(request.headers(), redact_secrets)
+        );
+    }
     let handshake = async {
-        if let Some(proxy) = proxy.filter(|p| !p.trim().is_empty()) {
+        let result = if let Some(proxy) = proxy.filter(|p| !p.trim().is_empty()) {
             let proxy_scheme = url::Url::parse(proxy)
                 .map_err(|_| "invalid proxy URL".to_string())?
                 .scheme()
@@ -252,30 +277,68 @@ pub async fn connect_to(
             };
             client_async_tls_with_config(request, stream, None, None)
                 .await
-                .map(|(socket, _)| socket)
-                .map_err(|e| websocket_error(&e))
+                .map_err(|e| websocket_error(&e, wire_id, redact_secrets))
         } else {
             connect_async(request)
                 .await
-                .map(|(socket, _)| socket)
-                .map_err(|e| websocket_error(&e))
+                .map_err(|e| websocket_error(&e, wire_id, redact_secrets))
+        };
+        let (socket, response) = result?;
+        if crate::logger::wire_debug_enabled() {
+            tracing::debug!(
+                target: "wire",
+                id = wire_id,
+                "UPSTREAM_WSS <- HANDSHAKE HTTP {} headers={}",
+                response.status(),
+                crate::logger::format_tungstenite_headers(response.headers(), redact_secrets)
+            );
         }
+        Ok(socket)
     };
     timeout(Duration::from_secs(60), handshake)
         .await
         .map_err(|_| "upstream WebSocket connection timed out".to_string())?
 }
 
-fn websocket_error(error: &tokio_tungstenite::tungstenite::Error) -> ConnectionError {
+fn websocket_error(
+    error: &tokio_tungstenite::tungstenite::Error,
+    wire_id: u64,
+    redact_secrets: bool,
+) -> ConnectionError {
     match error {
-        tokio_tungstenite::tungstenite::Error::Http(response) => ConnectionError {
-            status: Some(response.status().as_u16()),
-            message: format!(
-                "upstream WebSocket handshake returned HTTP {}",
-                response.status()
-            ),
-        },
-        _ => "upstream WebSocket connection failed".into(),
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            if crate::logger::wire_debug_enabled() {
+                let body_text = response
+                    .body()
+                    .as_deref()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
+                tracing::debug!(
+                    target: "wire",
+                    id = wire_id,
+                    "UPSTREAM_WSS <- HANDSHAKE_ERROR HTTP {} headers={} body={body_text}",
+                    response.status(),
+                    crate::logger::format_tungstenite_headers(response.headers(), redact_secrets)
+                );
+            }
+            ConnectionError {
+                status: Some(response.status().as_u16()),
+                message: format!(
+                    "upstream WebSocket handshake returned HTTP {}",
+                    response.status()
+                ),
+            }
+        }
+        other => {
+            if crate::logger::wire_debug_enabled() {
+                tracing::debug!(
+                    target: "wire",
+                    id = wire_id,
+                    "UPSTREAM_WSS <- CONNECT_ERROR {other}"
+                );
+            }
+            "upstream WebSocket connection failed".into()
+        }
     }
 }
 
@@ -309,9 +372,17 @@ pub fn prepare_body(mut body: Value) -> Result<Value, String> {
     Ok(body)
 }
 
-pub async fn start(ws: &mut UpstreamSocket, body: Value) -> Result<(), String> {
+pub async fn start(ws: &mut UpstreamSocket, body: Value, wire_id: u64) -> Result<(), String> {
     let body = prepare_body(body)?;
-    ws.send(Message::Text(body.to_string().into()))
+    let encoded = body.to_string();
+    if crate::logger::wire_debug_enabled() {
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_WSS -> SEND {encoded}"
+        );
+    }
+    ws.send(Message::Text(encoded.into()))
         .await
         .map_err(|_| "failed to send upstream response.create".into())
 }

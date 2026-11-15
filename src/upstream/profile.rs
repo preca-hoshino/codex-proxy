@@ -60,12 +60,41 @@ pub fn user_agent() -> String {
 }
 
 async fn fetch_release(client: &reqwest::Client) -> Option<String> {
-    let mut response = client.get(RELEASE_URL).send().await.ok()?;
-    if !response.status().is_success()
+    let wire_id = crate::logger::next_request_id();
+    if crate::logger::wire_debug_enabled() {
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_PROFILE -> GET {RELEASE_URL}"
+        );
+    }
+    let mut response = match client.get(RELEASE_URL).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            if crate::logger::wire_debug_enabled() {
+                tracing::debug!(
+                    target: "wire",
+                    id = wire_id,
+                    "UPSTREAM_PROFILE <- ERROR {err}"
+                );
+            }
+            return None;
+        }
+    };
+    let status = response.status();
+    let resp_headers = crate::logger::format_reqwest_headers(response.headers(), true);
+    if !status.is_success()
         || response
             .content_length()
             .is_some_and(|length| length > MAX_RELEASE_BYTES as u64)
     {
+        if crate::logger::wire_debug_enabled() {
+            tracing::debug!(
+                target: "wire",
+                id = wire_id,
+                "UPSTREAM_PROFILE <- HTTP {status} headers={resp_headers}"
+            );
+        }
         return None;
     }
     let mut body = Vec::new();
@@ -74,6 +103,14 @@ async fn fetch_release(client: &reqwest::Client) -> Option<String> {
             return None;
         }
         body.extend_from_slice(&chunk);
+    }
+    if crate::logger::wire_debug_enabled() {
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_PROFILE <- HTTP {status} headers={resp_headers} body={}",
+            String::from_utf8_lossy(&body)
+        );
     }
     parse_release(&body)
 }

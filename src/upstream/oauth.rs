@@ -51,16 +51,51 @@ pub fn auth_url() -> (String, String, String) {
 
 async fn token_response(
     response: Result<reqwest::Response, reqwest::Error>,
+    wire_id: u64,
+    redact_secrets: bool,
 ) -> Result<Value, String> {
-    // Do not include response bodies or request URLs in errors: they may contain secrets.
-    let response = response.map_err(|_| "OAuth token request failed".to_string())?;
+    // Do not include response bodies or request URLs in returned errors: they may contain secrets.
+    let response = match response {
+        Ok(r) => r,
+        Err(err) => {
+            if crate::logger::wire_debug_enabled() {
+                tracing::debug!(
+                    target: "wire",
+                    id = wire_id,
+                    "UPSTREAM_OAUTH <- ERROR {err}"
+                );
+            }
+            return Err("OAuth token request failed".to_string());
+        }
+    };
     let status = response.status();
+    let resp_headers = crate::logger::format_reqwest_headers(response.headers(), redact_secrets);
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if crate::logger::wire_debug_enabled() {
+                tracing::debug!(
+                    target: "wire",
+                    id = wire_id,
+                    "UPSTREAM_OAUTH <- HTTP {status} headers={resp_headers} body=<read error: {err}>"
+                );
+            }
+            return Err("OAuth token response was invalid".to_string());
+        }
+    };
+    if crate::logger::wire_debug_enabled() {
+        let body_text = String::from_utf8_lossy(&bytes);
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_OAUTH <- HTTP {status} headers={resp_headers} body={}",
+            crate::logger::redact_json_str(&body_text, redact_secrets)
+        );
+    }
     if !status.is_success() {
         return Err(format!("OAuth token endpoint returned HTTP {status}"));
     }
-    let data: Value = response
-        .json()
-        .await
+    let data: Value = serde_json::from_slice(&bytes)
         .map_err(|_| "OAuth token response was invalid".to_string())?;
     if !data.is_object() {
         return Err("OAuth token response was not an object".to_string());
@@ -68,24 +103,86 @@ async fn token_response(
     Ok(data)
 }
 
-pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<Value, String> {
-    let response = client.post(TOKEN_URL)
-        .header("originator", profile::ORIGINATOR)
-        .header("user-agent", profile::user_agent())
-        .json(&json!({"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": refresh_token}))
-        .timeout(Duration::from_secs(60)).send().await;
-    token_response(response).await
+pub async fn refresh(
+    client: &reqwest::Client,
+    refresh_token: &str,
+    redact_secrets: bool,
+) -> Result<Value, String> {
+    let wire_id = crate::logger::next_request_id();
+    let payload = json!({"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": refresh_token});
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "originator",
+        reqwest::header::HeaderValue::from_static(profile::ORIGINATOR),
+    );
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&profile::user_agent()) {
+        headers.insert(reqwest::header::USER_AGENT, value);
+    }
+    if crate::logger::wire_debug_enabled() {
+        let mut logged_payload = payload.clone();
+        if redact_secrets {
+            crate::logger::redact_json_value(&mut logged_payload);
+        }
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_OAUTH -> POST {TOKEN_URL} headers={} body={logged_payload}",
+            crate::logger::format_reqwest_headers(&headers, redact_secrets)
+        );
+    }
+    let response = client
+        .post(TOKEN_URL)
+        .headers(headers)
+        .json(&payload)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await;
+    token_response(response, wire_id, redact_secrets).await
 }
 
 pub async fn exchange_code(
     client: &reqwest::Client,
     code: &str,
     verifier: &str,
+    redact_secrets: bool,
 ) -> Result<Value, String> {
+    let wire_id = crate::logger::next_request_id();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "originator",
+        reqwest::header::HeaderValue::from_static(profile::ORIGINATOR),
+    );
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&profile::user_agent()) {
+        headers.insert(reqwest::header::USER_AGENT, value);
+    }
+    if crate::logger::wire_debug_enabled() {
+        let body = if redact_secrets {
+            json!({
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "code": "[redacted]",
+                "redirect_uri": REDIRECT_URI,
+                "code_verifier": "[redacted]",
+            })
+        } else {
+            json!({
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "code_verifier": verifier,
+            })
+        };
+        tracing::debug!(
+            target: "wire",
+            id = wire_id,
+            "UPSTREAM_OAUTH -> POST {TOKEN_URL} headers={} body={body}",
+            crate::logger::format_reqwest_headers(&headers, redact_secrets)
+        );
+    }
     let response = client
         .post(TOKEN_URL)
-        .header("originator", profile::ORIGINATOR)
-        .header("user-agent", profile::user_agent())
+        .headers(headers)
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
@@ -96,7 +193,7 @@ pub async fn exchange_code(
         .timeout(Duration::from_secs(60))
         .send()
         .await;
-    token_response(response).await
+    token_response(response, wire_id, redact_secrets).await
 }
 
 #[cfg(test)]
