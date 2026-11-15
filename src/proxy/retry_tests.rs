@@ -302,6 +302,153 @@ async fn invalid_cache_key_is_rejected_before_account_selection_or_network_io() 
 }
 
 #[tokio::test]
+async fn chat_image_media_type_reaches_upstream_without_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let sent: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(
+            sent["input"][0]["content"][0],
+            json!({
+                "type":"input_image", "image_url":"data:image/png;base64,AA==", "detail":"high"
+            })
+        );
+        ws.send(Message::Text(json!({"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0}}}).to_string().into())).await.unwrap();
+    });
+    let (_dir, state) = prepare(format!("ws://{addr}/responses")).await;
+    let mut logs = state.logs.subscribe();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"model":"test","stream":true,"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","media_type":"image/png","detail":"high"}}
+        ]}]}).to_string()))
+        .unwrap();
+    let response = proxy::server::router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body(response).await.contains("[DONE]"));
+    server.await.unwrap();
+    assert!(std::iter::from_fn(|| logs.try_recv().ok()).all(|entry| !entry.contains("[REJECTED]")));
+}
+
+#[tokio::test]
+async fn chat_tool_text_array_reaches_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let sent: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(
+            sent["input"][0],
+            json!({"type":"function_call_output","call_id":"call_1","output":"first\nsecond"})
+        );
+        ws.send(Message::Text(json!({"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0}}}).to_string().into())).await.unwrap();
+    });
+    let (_dir, state) = prepare(format!("ws://{addr}/responses")).await;
+    let mut logs = state.logs.subscribe();
+    let request = Request::builder().method("POST").uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"model":"test","stream":true,"messages":[{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"first\n"},{"type":"text","text":"second"}]}]}).to_string())).unwrap();
+    let response = proxy::server::router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body(response).await.contains("[DONE]"));
+    server.await.unwrap();
+    assert!(std::iter::from_fn(|| logs.try_recv().ok()).all(|entry| !entry.contains("[REJECTED]")));
+}
+
+#[tokio::test]
+async fn chat_tool_image_array_reaches_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let sent: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(
+            sent["input"][0],
+            json!({"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"screenshot"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA=="}
+            ]})
+        );
+        ws.send(Message::Text(json!({"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0}}}).to_string().into())).await.unwrap();
+    });
+    let (_dir, state) = prepare(format!("ws://{addr}/responses")).await;
+    let mut logs = state.logs.subscribe();
+    let request = Request::builder().method("POST").uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"model":"test","stream":true,"messages":[{"role":"tool","tool_call_id":"call_1","content":[
+            {"type":"text","text":"screenshot"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","media_type":"image/png"}}
+        ]}]}).to_string())).unwrap();
+    let response = proxy::server::router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body(response).await.contains("[DONE]"));
+    server.await.unwrap();
+    assert!(std::iter::from_fn(|| logs.try_recv().ok()).all(|entry| !entry.contains("[REJECTED]")));
+}
+
+#[tokio::test]
+async fn invalid_tool_request_reports_specific_safe_detail() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_dir, state) = prepare(format!("ws://{}/responses", listener.local_addr().unwrap())).await;
+    let cases = [
+        (
+            json!({"messages":[{"role":"tool","tool_call_id":"private-id","content":{"text":"private prompt"}}]}),
+            "tool_content_invalid_type",
+        ),
+        (
+            json!({"messages":[{"role":"user","content":"private prompt"}],"tools":"private value"}),
+            "tools_not_array",
+        ),
+        (
+            json!({"messages":[{"role":"user","content":"private prompt"}],"tool_choice":"private value"}),
+            "invalid_tool_choice",
+        ),
+    ];
+    for (mut payload, detail) in cases {
+        payload["model"] = json!("test");
+        let mut logs = state.logs.subscribe();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = proxy::server::router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let messages: Vec<_> = std::iter::from_fn(|| logs.try_recv().ok()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("reason=invalid_tools")
+                    && message.contains(&format!("detail={detail}"))),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|message| !message.contains("private")),
+            "{messages:?}"
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(validation_detail("tool private value"), "unspecified");
+}
+
+#[tokio::test]
 async fn locally_rejected_chat_request_reports_safe_reason_and_does_not_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (_dir, state) = prepare(format!("ws://{}/responses", listener.local_addr().unwrap())).await;

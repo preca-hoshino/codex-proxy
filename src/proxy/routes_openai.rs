@@ -57,10 +57,33 @@ fn request_validation_reason(message: &str) -> &'static str {
     }
 }
 
+fn validation_detail(message: &str) -> &'static str {
+    match message {
+        "tool content must be a string or content array" => "tool_content_invalid_type",
+        "tool content part must be text or image" => "tool_content_part_unsupported_type",
+        "tool content part text must be a string" => "tool_content_part_text_not_string",
+        "tool message cannot contain tool_calls" => "tool_message_has_tool_calls",
+        "tool_call_id is only valid on tool messages" => "tool_call_id_wrong_role",
+        "tool_calls is only valid on assistant messages" => "tool_calls_wrong_role",
+        "tool_calls must be an array" => "tool_calls_not_array",
+        "only function tool calls are supported" => "unsupported_tool_call_type",
+        "function is required" => "tool_call_function_missing",
+        "tool arguments must be a string" => "tool_arguments_not_string",
+        "tools must be an array" => "tools_not_array",
+        "only function tools are supported" => "unsupported_tool_type",
+        "tool.function is required" => "tool_function_missing",
+        "invalid tool_choice" => "invalid_tool_choice",
+        "only function tool_choice is supported" => "unsupported_tool_choice_type",
+        "tool_choice.function required" => "tool_choice_function_missing",
+        "parallel_tool_calls must be a boolean" => "parallel_tool_calls_not_boolean",
+        _ => "unspecified",
+    }
+}
+
 fn validation_error(state: &AppState, route: &'static str, message: &str) -> Response {
     let _ = state.logs.send(format!(
-        "[REJECTED] route={route} reason={} Request rejected before upstream; no token usage available",
-        request_validation_reason(message)
+        "[REJECTED] route={route} reason={} detail={} Request rejected before upstream; no token usage available",
+        request_validation_reason(message), validation_detail(message)
     ));
     error(StatusCode::BAD_REQUEST, message)
 }
