@@ -22,6 +22,8 @@ pub struct ServerConfig {
     /// Transport used between this proxy and the ChatGPT Codex backend.
     pub upstream_transport: String,
     pub auto_prompt_cache: bool,
+    pub log_level: String,
+    pub log_redact_secrets: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +54,8 @@ impl Default for ServerConfig {
             api_key: None,
             upstream_transport: "wss".into(),
             auto_prompt_cache: true,
+            log_level: "info".into(),
+            log_redact_secrets: false,
         }
     }
 }
@@ -93,6 +97,11 @@ impl AppConfig {
         anyhow::ensure!(
             ["wss", "http"].contains(&self.server.upstream_transport.as_str()),
             "server.upstream_transport must be wss or http"
+        );
+        let level = self.server.log_level.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            ["error", "warn", "info", "debug", "trace"].contains(&level.as_str()),
+            "server.log_level must be error, warn, info, debug, or trace"
         );
         anyhow::ensure!(
             ["round_robin", "priority"].contains(&self.rotation.strategy.as_str()),
@@ -138,6 +147,11 @@ pub fn set_value(path: &Path, key: &str, value: &str) -> Result<()> {
         "server.auto_prompt_cache" => {
             config.server.auto_prompt_cache = value.parse().context("invalid auto_prompt_cache")?
         }
+        "server.log_level" => config.server.log_level = value.to_ascii_lowercase(),
+        "server.log_redact_secrets" => {
+            config.server.log_redact_secrets =
+                value.parse().context("invalid log_redact_secrets")?
+        }
         "rotation.strategy" => config.rotation.strategy = value.to_owned(),
         "rotation.cooldown_ms" => {
             config.rotation.cooldown_ms = value.parse().context("invalid cooldown")?
@@ -167,10 +181,25 @@ mod tests {
     fn transport_defaults_to_wss_and_validates_http_and_unknown_values() {
         let mut config: AppConfig = toml::from_str("[server]\nport = 8318\n").unwrap();
         assert_eq!(config.server.upstream_transport, "wss");
+        assert_eq!(config.server.log_level, "info");
+        assert!(!config.server.log_redact_secrets);
         assert!(config.validate().is_ok());
         config.server.upstream_transport = "http".into();
         assert!(config.validate().is_ok());
         config.server.upstream_transport = "tcp".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn log_level_validates_supported_levels() {
+        let mut config = AppConfig::default();
+        for level in ["error", "warn", "info", "debug", "trace", "DEBUG", "Info"] {
+            config.server.log_level = level.into();
+            assert!(config.validate().is_ok(), "{level}");
+        }
+        for invalid in ["verbose", "all", ""] {
+            config.server.log_level = invalid.into();
+            assert!(config.validate().is_err(), "{invalid}");
+        }
     }
 }

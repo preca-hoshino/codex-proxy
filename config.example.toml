@@ -4,6 +4,8 @@ port = 8318
 accounts_file = "accounts.json"
 upstream_transport = "wss" # wss or http; applies to connections to ChatGPT
 auto_prompt_cache = true # derive a stable cache key when the client does not supply one
+log_level = "info" # error, warn, info, debug, or trace
+log_redact_secrets = false # set true to redact Authorization / token / API key secrets in debug wire logs
 # proxy = "http://127.0.0.1:7890"
 # api_key = "replace-with-a-long-random-key"
 
