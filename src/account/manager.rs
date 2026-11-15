@@ -22,10 +22,20 @@ pub struct AccountManager {
     model_catalogs: Mutex<HashMap<String, (Instant, Value)>>,
     client: reqwest::Client,
     strategy: String,
+    redact_secrets: bool,
 }
 
 impl AccountManager {
     pub fn open(path: PathBuf, client: reqwest::Client, strategy: String) -> Result<Arc<Self>> {
+        Self::open_with_redaction(path, client, strategy, true)
+    }
+
+    pub fn open_with_redaction(
+        path: PathBuf,
+        client: reqwest::Client,
+        strategy: String,
+        redact_secrets: bool,
+    ) -> Result<Arc<Self>> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
@@ -51,6 +61,7 @@ impl AccountManager {
             model_catalogs: Mutex::new(HashMap::new()),
             client,
             strategy,
+            redact_secrets,
         }))
     }
     fn save(&self, accounts: &[Account]) -> Result<()> {
@@ -89,7 +100,7 @@ impl AccountManager {
             .refresh_token
             .as_deref()
             .ok_or_else(|| anyhow!("expired account has no refresh token"))?;
-        let value = crate::upstream::refresh(&self.client, refresh)
+        let value = crate::upstream::refresh(&self.client, refresh, self.redact_secrets)
             .await
             .map_err(|e| anyhow!("token refresh failed: {e}"))?;
         let access = value
@@ -342,17 +353,64 @@ impl AccountManager {
                 }
             };
             drop(_guard); // Quota lookup does not require the credential refresh lock.
-            let response = self
-                .client
-                .get("https://chatgpt.com/backend-api/wham/usage")
-                .bearer_auth(&acc.access_token)
-                .header("chatgpt-account-id", &acc.id)
-                .header("user-agent", profile::user_agent())
-                .send()
-                .await;
+            let url = "https://chatgpt.com/backend-api/wham/usage";
+            let mut req_headers = reqwest::header::HeaderMap::new();
+            if let Ok(value) =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", acc.access_token))
+            {
+                req_headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&acc.id) {
+                req_headers.insert("chatgpt-account-id", value);
+            }
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&profile::user_agent()) {
+                req_headers.insert(reqwest::header::USER_AGENT, value);
+            }
+            let wire_id = crate::logger::next_request_id();
+            if crate::logger::wire_debug_enabled() {
+                tracing::debug!(
+                    target: "wire",
+                    id = wire_id,
+                    "UPSTREAM_USAGE -> GET {url} headers={}",
+                    crate::logger::format_reqwest_headers(&req_headers, self.redact_secrets)
+                );
+            }
+            let response = self.client.get(url).headers(req_headers).send().await;
             let quota = match response {
-                Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
-                _ => None,
+                Ok(r) => {
+                    let status = r.status();
+                    let resp_headers =
+                        crate::logger::format_reqwest_headers(r.headers(), self.redact_secrets);
+                    let bytes = r.bytes().await.ok();
+                    if crate::logger::wire_debug_enabled() {
+                        let body_text = bytes
+                            .as_deref()
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                            .unwrap_or_else(|| "<body read failed>".into());
+                        tracing::debug!(
+                            target: "wire",
+                            id = wire_id,
+                            "UPSTREAM_USAGE <- HTTP {status} headers={resp_headers} body={body_text}"
+                        );
+                    }
+                    if status.is_success() {
+                        bytes
+                            .as_deref()
+                            .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => {
+                    if crate::logger::wire_debug_enabled() {
+                        tracing::debug!(
+                            target: "wire",
+                            id = wire_id,
+                            "UPSTREAM_USAGE <- ERROR {err}"
+                        );
+                    }
+                    None
+                }
             };
             if let Some(quota) = quota {
                 let mut accounts = self.accounts.lock().await;
@@ -373,9 +431,9 @@ impl AccountManager {
         );
         Ok(())
     }
-    pub async fn models(&self) -> Result<Value> {
+    pub async fn models_with_wire_id(&self, wire_id: u64) -> Result<Value> {
         let acc = self.select(&[]).await?;
-        self.fetch_models(&acc).await
+        self.fetch_models(&acc, wire_id).await
     }
 
     /// Fetch the catalog for one account without changing the rotation order.
@@ -387,14 +445,16 @@ impl AccountManager {
             .await?
             .ok_or_else(|| anyhow!("account not found or disabled"))?;
         drop(guard);
-        self.fetch_models(&acc).await
+        self.fetch_models(&acc, crate::logger::next_request_id())
+            .await
     }
 
     /// Ultra is a client mode: derive its wire effort from this account's model metadata.
-    pub async fn resolve_request_reasoning(
+    pub async fn resolve_request_reasoning_with_wire_id(
         &self,
         account: &Account,
         body: &mut Value,
+        wire_id: u64,
     ) -> Result<()> {
         if body.pointer("/reasoning/effort").and_then(Value::as_str) != Some("ultra") {
             return Ok(());
@@ -410,7 +470,7 @@ impl AccountManager {
         let catalog = match cached {
             Some(catalog) => catalog,
             None => self
-                .fetch_models(account)
+                .fetch_models(account, wire_id)
                 .await
                 .context("model catalog unavailable for Ultra reasoning resolution")?,
         };
@@ -418,20 +478,72 @@ impl AccountManager {
         Ok(())
     }
 
-    async fn fetch_models(&self, acc: &Account) -> Result<Value> {
-        let r = self
+    async fn fetch_models(&self, acc: &Account, wire_id: u64) -> Result<Value> {
+        let url = "https://chatgpt.com/backend-api/codex/models";
+        let version = profile::version();
+        let mut req_headers = reqwest::header::HeaderMap::new();
+        if let Ok(value) =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", acc.access_token))
+        {
+            req_headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&acc.id) {
+            req_headers.insert("chatgpt-account-id", value);
+        }
+        req_headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(profile::ORIGINATOR),
+        );
+        req_headers.insert(
+            "version",
+            reqwest::header::HeaderValue::from_static(version),
+        );
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&profile::user_agent()) {
+            req_headers.insert(reqwest::header::USER_AGENT, value);
+        }
+        if crate::logger::wire_debug_enabled() {
+            tracing::debug!(
+                target: "wire",
+                id = wire_id,
+                "UPSTREAM_MODELS -> GET {url}?client_version={version} headers={}",
+                crate::logger::format_reqwest_headers(&req_headers, self.redact_secrets)
+            );
+        }
+        let r = match self
             .client
-            .get("https://chatgpt.com/backend-api/codex/models")
-            .query(&[("client_version", profile::version())])
-            .bearer_auth(&acc.access_token)
-            .header("chatgpt-account-id", &acc.id)
-            .header("originator", profile::ORIGINATOR)
-            .header("version", profile::version())
-            .header("user-agent", profile::user_agent())
+            .get(url)
+            .query(&[("client_version", version)])
+            .headers(req_headers)
             .send()
-            .await?
-            .error_for_status()?;
-        let catalog: Value = r.json().await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                if crate::logger::wire_debug_enabled() {
+                    tracing::debug!(
+                        target: "wire",
+                        id = wire_id,
+                        "UPSTREAM_MODELS <- ERROR {err}"
+                    );
+                }
+                return Err(err.into());
+            }
+        };
+        let status = r.status();
+        let resp_headers = crate::logger::format_reqwest_headers(r.headers(), self.redact_secrets);
+        let bytes = r.bytes().await?;
+        if crate::logger::wire_debug_enabled() {
+            tracing::debug!(
+                target: "wire",
+                id = wire_id,
+                "UPSTREAM_MODELS <- HTTP {status} headers={resp_headers} body={}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!("HTTP status {status} from upstream model catalog");
+        }
+        let catalog: Value = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(
             catalog.get("models").and_then(Value::as_array).is_some(),
             "upstream model catalog is invalid"
