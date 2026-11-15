@@ -113,6 +113,31 @@ fn keys(v: &Value, allowed: &[&str], path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn convert_image_part(item: &Value) -> Result<Value, String> {
+    keys(item, &["type", "image_url"], "image part")?;
+    let image = item.get("image_url").ok_or("image_url is required")?;
+    let (url, detail) = if let Some(s) = image.as_str() {
+        (s, None)
+    } else {
+        keys(image, &["url", "detail", "media_type"], "image_url")?;
+        if image
+            .get("media_type")
+            .is_some_and(|value| !value.is_null() && !value.as_str().is_some_and(|s| !s.is_empty()))
+        {
+            return Err("image_url.media_type must be a non-empty string".into());
+        }
+        (str_field(image, "url")?, image.get("detail"))
+    };
+    let mut converted = json!({"type":"input_image", "image_url":url});
+    if let Some(d) = detail {
+        if !matches!(d.as_str(), Some("auto" | "low" | "high")) {
+            return Err("invalid image detail".into());
+        }
+        converted["detail"] = d.clone();
+    }
+    Ok(converted)
+}
+
 /// Convert an OpenAI Chat request to a Responses request. Codex-specific option
 /// cleanup leaves structural validation and downstream usage reporting intact.
 pub fn chat_to_responses(body: &Value) -> Result<Value, String> {
@@ -183,10 +208,38 @@ pub fn chat_to_responses(body: &Value) -> Result<Value, String> {
         let role = str_field(msg, "role")?;
         if role == "tool" {
             let call_id = str_field(msg, "tool_call_id")?;
-            let output = msg
-                .get("content")
-                .and_then(Value::as_str)
-                .ok_or("tool content must be a string")?;
+            let output = match msg.get("content") {
+                Some(Value::String(text)) => json!(text),
+                Some(Value::Array(parts)) => {
+                    let mut output = String::new();
+                    let mut converted = Vec::new();
+                    let mut has_image = false;
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                keys(part, &["type", "text"], "tool content part")?;
+                                let text = part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .ok_or("tool content part text must be a string")?;
+                                output.push_str(text);
+                                converted.push(json!({"type":"input_text","text":text}));
+                            }
+                            Some("image_url") => {
+                                converted.push(convert_image_part(part)?);
+                                has_image = true;
+                            }
+                            _ => return Err("tool content part must be text or image".into()),
+                        }
+                    }
+                    if has_image {
+                        json!(converted)
+                    } else {
+                        json!(output)
+                    }
+                }
+                _ => return Err("tool content must be a string or content array".into()),
+            };
             if msg.get("tool_calls").is_some_and(|v| !v.is_null()) {
                 return Err("tool message cannot contain tool_calls".into());
             }
@@ -223,22 +276,7 @@ pub fn chat_to_responses(body: &Value) -> Result<Value, String> {
                             parts.push(json!({"type":text_kind,"text":s}));
                         }
                         "image_url" if role == "user" => {
-                            keys(item, &["type", "image_url"], "image part")?;
-                            let image = item.get("image_url").ok_or("image_url is required")?;
-                            let (url, detail) = if let Some(s) = image.as_str() {
-                                (s, None)
-                            } else {
-                                keys(image, &["url", "detail"], "image_url")?;
-                                (str_field(image, "url")?, image.get("detail"))
-                            };
-                            let mut converted = json!({"type":"input_image", "image_url":url});
-                            if let Some(d) = detail {
-                                if !matches!(d.as_str(), Some("auto" | "low" | "high")) {
-                                    return Err("invalid image detail".into());
-                                }
-                                converted["detail"] = d.clone();
-                            }
-                            parts.push(converted);
+                            parts.push(convert_image_part(item)?);
                         }
                         _ => return Err(format!("unsupported content part: {kind}")),
                     }
@@ -684,6 +722,103 @@ mod tests {
             &json!({"model":"x","messages":[{"role":"user","content":"x"}],"stop":["x"]})
         )
         .is_err());
+    }
+
+    #[test]
+    fn converts_tool_text_content_arrays_without_losing_text() {
+        for (content, expected) in [
+            (json!("unchanged"), "unchanged"),
+            (
+                json!([{"type":"text","text":"first\n"},{"type":"text","text":"second"}]),
+                "first\nsecond",
+            ),
+            (json!([]), ""),
+        ] {
+            let request = json!({"model":"x","messages":[{"role":"tool","tool_call_id":"call_1","content":content}]});
+            let result = chat_to_responses(&request).unwrap();
+            assert_eq!(
+                result["input"][0],
+                json!({"type":"function_call_output","call_id":"call_1","output":expected})
+            );
+        }
+        for content in [
+            json!(null),
+            json!({"text":"value"}),
+            json!([{"type":"audio","audio":"data"}]),
+            json!([{"type":"text","text":42}]),
+            json!([{"type":"text","text":"ok","extra":"value"}]),
+        ] {
+            let request = json!({"model":"x","messages":[{"role":"tool","tool_call_id":"call_1","content":content}]});
+            assert!(chat_to_responses(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn converts_multimodal_tool_output_in_order_and_validates_images() {
+        let request = json!({"model":"x","messages":[{"role":"tool","tool_call_id":"call_1","content":[
+            {"type":"text","text":"before"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","media_type":"image/png","detail":"high"}},
+            {"type":"text","text":"after"},
+            {"type":"image_url","image_url":"https://example.com/a.png"}
+        ]}]});
+        let result = chat_to_responses(&request).unwrap();
+        assert_eq!(
+            result["input"][0],
+            json!({"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"before"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"high"},
+                {"type":"input_text","text":"after"},
+                {"type":"input_image","image_url":"https://example.com/a.png"}
+            ]})
+        );
+        for image in [
+            json!({"url":"https://example.com/a.png","media_type":false}),
+            json!({"url":"https://example.com/a.png","detail":"invalid"}),
+            json!({"url":"https://example.com/a.png","extra":true}),
+            json!({}),
+        ] {
+            let request = json!({"model":"x","messages":[{"role":"tool","tool_call_id":"call_1","content":[{"type":"image_url","image_url":image}]}]});
+            assert!(chat_to_responses(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn image_media_type_is_accepted_as_metadata_without_changing_image_url() {
+        for url in [
+            "data:image/png;base64,AA==",
+            "https://example.com/image.png",
+        ] {
+            let request = json!({"model":"x","messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":url,"detail":"high","media_type":"image/png"}}
+            ]}]});
+            let result = chat_to_responses(&request).unwrap();
+            assert_eq!(
+                result["input"][0]["content"][0],
+                json!({
+                    "type":"input_image", "image_url":url, "detail":"high"
+                })
+            );
+            assert_eq!(
+                request["messages"][0]["content"][0]["image_url"]["media_type"],
+                "image/png"
+            );
+        }
+        for media_type in [json!(false), json!(42), json!(""), json!({})] {
+            let request = json!({"model":"x","messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://example.com/image.png","media_type":media_type}}
+            ]}]});
+            assert_eq!(
+                chat_to_responses(&request).unwrap_err(),
+                "image_url.media_type must be a non-empty string"
+            );
+        }
+        let request = json!({"model":"x","messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"https://example.com/image.png","media_type":"image/png","unknown":true}}
+        ]}]});
+        assert_eq!(
+            chat_to_responses(&request).unwrap_err(),
+            "unsupported parameter: image_url.unknown"
+        );
     }
 
     #[test]
