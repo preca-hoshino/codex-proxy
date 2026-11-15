@@ -181,11 +181,19 @@ fn add_automatic_cache_key(body: &mut Value, headers: &HeaderMap, enabled: bool)
 pub(super) async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
-pub(super) async fn models(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub(super) async fn models(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    extensions: axum::http::Extensions,
+) -> Response {
     if !authorized(&headers, &s) {
         return error(StatusCode::UNAUTHORIZED, "invalid API key");
     }
-    match s.accounts.models().await {
+    let wire_id = extensions
+        .get::<crate::logger::WireRequestId>()
+        .map(|w| w.0)
+        .unwrap_or_else(crate::logger::next_request_id);
+    match s.accounts.models_with_wire_id(wire_id).await {
         Ok(v) => {
             let data: Vec<Value> = v
                 .get("models")
@@ -299,6 +307,7 @@ impl From<&str> for UpstreamOpenError {
 async fn open_upstream(
     s: &AppState,
     body: Value,
+    wire_id: u64,
 ) -> Result<(crate::upstream::http::UpstreamEvents, Vec<String>), UpstreamOpenError> {
     let mut tried = Vec::new();
     let timeout = Duration::from_millis(s.config.retry.timeout_ms);
@@ -310,7 +319,7 @@ async fn open_upstream(
         tried.push(a.id.clone());
         let mut account_body = body.clone();
         s.accounts
-            .resolve_request_reasoning(&a, &mut account_body)
+            .resolve_request_reasoning_with_wire_id(&a, &mut account_body, wire_id)
             .await
             .map_err(|_| "Could not resolve reasoning effort from the upstream model catalog")?;
         let model = account_body
@@ -329,6 +338,7 @@ async fn open_upstream(
         let endpoint = s.test_upstream_url.as_deref();
         #[cfg(not(test))]
         let endpoint: Option<&str> = None;
+        let redact = s.config.server.log_redact_secrets;
         let attempt = tokio::time::timeout(timeout, async {
             if s.config.server.upstream_transport == "http" {
                 let result = if let Some(url) = endpoint {
@@ -338,6 +348,8 @@ async fn open_upstream(
                         &a.access_token,
                         Some(&a.id),
                         account_body,
+                        wire_id,
+                        redact,
                     )
                     .await
                 } else {
@@ -346,6 +358,8 @@ async fn open_upstream(
                         &a.access_token,
                         Some(&a.id),
                         account_body,
+                        wire_id,
+                        redact,
                     )
                     .await
                 };
@@ -358,6 +372,8 @@ async fn open_upstream(
                         Some(&a.id),
                         s.config.server.proxy.as_deref(),
                         account_body.get("prompt_cache_key").and_then(Value::as_str),
+                        wire_id,
+                        redact,
                     )
                     .await
                 } else {
@@ -366,17 +382,39 @@ async fn open_upstream(
                         Some(&a.id),
                         s.config.server.proxy.as_deref(),
                         account_body.get("prompt_cache_key").and_then(Value::as_str),
+                        wire_id,
+                        redact,
                     )
                     .await
                 };
                 let mut ws = connection.map_err(|e| (e.status, e.to_string()))?;
                 // A transport failure after sending is ambiguous: never replay it.
-                crate::upstream::start(&mut ws, account_body)
+                crate::upstream::start(&mut ws, account_body, wire_id)
                     .await
                     .map_err(|e| (None, e))?;
                 let stream: crate::upstream::http::UpstreamEvents =
-                    Box::pin(ws.map(|item| {
-                        item.map_err(|_| "upstream WebSocket stream failed".to_owned())
+                    Box::pin(ws.map(move |item| match item {
+                        Ok(Message::Text(text)) => {
+                            if crate::logger::wire_debug_enabled() {
+                                tracing::debug!(
+                                    target: "wire",
+                                    id = wire_id,
+                                    "UPSTREAM_WSS <- RECV {text}"
+                                );
+                            }
+                            Ok(Message::Text(text))
+                        }
+                        Ok(other) => Ok(other),
+                        Err(err) => {
+                            if crate::logger::wire_debug_enabled() {
+                                tracing::debug!(
+                                    target: "wire",
+                                    id = wire_id,
+                                    "UPSTREAM_WSS <- STREAM_ERROR {err}"
+                                );
+                            }
+                            Err("upstream WebSocket stream failed".to_owned())
+                        }
                     }));
                 Ok(stream)
             }
@@ -470,11 +508,16 @@ async fn open_upstream(
 pub(super) async fn chat(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
     Json(body): Json<Value>,
 ) -> Response {
     if !authorized(&headers, &s) {
         return error(StatusCode::UNAUTHORIZED, "invalid API key");
     }
+    let wire_id = extensions
+        .get::<crate::logger::WireRequestId>()
+        .map(|w| w.0)
+        .unwrap_or_else(crate::logger::next_request_id);
     let mut request_log = RequestMetrics::new(
         s.logs.clone(),
         "chat",
@@ -504,7 +547,7 @@ pub(super) async fn chat(
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (ws, buffered) = match open_upstream(&s, upstream_body).await {
+    let (ws, buffered) = match open_upstream(&s, upstream_body, wire_id).await {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(target: "proxy", route = "chat", status = %e.status, "Upstream request could not start; token usage may be unavailable");
@@ -573,11 +616,16 @@ pub(super) async fn chat(
 pub(super) async fn responses(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
     Json(mut body): Json<Value>,
 ) -> Response {
     if !authorized(&headers, &s) {
         return error(StatusCode::UNAUTHORIZED, "invalid API key");
     }
+    let wire_id = extensions
+        .get::<crate::logger::WireRequestId>()
+        .map(|w| w.0)
+        .unwrap_or_else(crate::logger::next_request_id);
     let mut request_log = RequestMetrics::new(
         s.logs.clone(),
         "responses",
@@ -603,7 +651,7 @@ pub(super) async fn responses(
         Err(e) => return validation_error(&s, "responses", &e),
     };
     add_automatic_cache_key(&mut body, &headers, s.config.server.auto_prompt_cache);
-    let (ws, buffered) = match open_upstream(&s, body).await {
+    let (ws, buffered) = match open_upstream(&s, body, wire_id).await {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(target: "proxy", route = "responses", status = %e.status, "Upstream request could not start; token usage may be unavailable");

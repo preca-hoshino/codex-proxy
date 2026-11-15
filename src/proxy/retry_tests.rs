@@ -301,6 +301,184 @@ async fn invalid_cache_key_is_rejected_before_account_selection_or_network_io() 
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn wire_debug_logs_full_bidirectional_downstream_and_upstream_traffic() {
+    let _test_guard = crate::logger::test_lock().lock().await;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Visitor(Vec<String>);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push(format!("{value:?}"));
+                    } else {
+                        self.0.push(format!("{}={value:?}", field.name()));
+                    }
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(format!(
+                "[{} {}] {}",
+                event.metadata().level(),
+                event.metadata().target(),
+                visitor.0.join(" ")
+            ));
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let sent = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(sent.contains("full-wire-prompt"));
+        for event in [
+            json!({"type":"response.created","response":{"id":"resp_wire"}}),
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"full-wire-reply"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"full-wire-reply"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}),
+        ] {
+            ws.send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+    });
+
+    let (_dir, state) = prepare(format!("ws://{addr}/responses")).await;
+    let mut cfg = (*state.config).clone();
+    cfg.server.api_key = Some("downstream-secret-key".into());
+    cfg.server.log_level = "debug".into();
+    cfg.server.log_redact_secrets = true;
+    let state = Arc::new(AppState {
+        accounts: state.accounts.clone(),
+        config: Arc::new(cfg),
+        upstream_http_client: state.upstream_http_client.clone(),
+        test_upstream_url: state.test_upstream_url.clone(),
+        logs: state.logs.clone(),
+    });
+
+    let captured = Capture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("debug"))
+        .with(captured.clone());
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer downstream-secret-key")
+        .body(Body::from(
+            json!({
+                "model":"test",
+                "messages":[{"role":"user","content":"full-wire-prompt"}],
+                "stream":true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = proxy::server::router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = body(response).await;
+    assert!(response_body.contains("full-wire-reply"), "{response_body}");
+    server.await.unwrap();
+
+    let lines = captured.0.lock().unwrap().clone();
+    assert!(
+        lines.iter().any(|l| l.contains("[DEBUG wire]")
+            && l.contains("DOWNSTREAM -> POST /v1/chat/completions")
+            && l.contains("full-wire-prompt")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("[DEBUG wire]") && l.contains("UPSTREAM_WSS -> HANDSHAKE")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("[DEBUG wire]")
+            && l.contains("UPSTREAM_WSS -> SEND")
+            && l.contains("full-wire-prompt")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("[DEBUG wire]")
+            && l.contains("UPSTREAM_WSS <- RECV")
+            && l.contains("full-wire-reply")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("[DEBUG wire]")
+            && l.contains("DOWNSTREAM <- CHUNK")
+            && l.contains("full-wire-reply")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.contains("downstream-secret-key") && !l.contains("test-token-1")),
+        "{lines:?}"
+    );
+
+    // When log_redact_secrets = false, raw Authorization values are also logged.
+    let mut cfg_unredacted = (*state.config).clone();
+    cfg_unredacted.server.log_redact_secrets = false;
+    let state_unredacted = Arc::new(AppState {
+        accounts: state.accounts.clone(),
+        config: Arc::new(cfg_unredacted),
+        upstream_http_client: state.upstream_http_client.clone(),
+        test_upstream_url: state.test_upstream_url.clone(),
+        logs: state.logs.clone(),
+    });
+    captured.0.lock().unwrap().clear();
+    let req2 = Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .header("authorization", "Bearer raw-visible-key")
+        .body(Body::empty())
+        .unwrap();
+    let res2 = proxy::server::router(state_unredacted)
+        .oneshot(req2)
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+    let _ = body(res2).await;
+    let lines2 = captured.0.lock().unwrap().clone();
+    assert!(
+        lines2
+            .iter()
+            .any(|l| l.contains("DOWNSTREAM -> GET /healthz") && l.contains("raw-visible-key")),
+        "{lines2:?}"
+    );
+    assert!(
+        lines2
+            .iter()
+            .any(|l| l.contains("DOWNSTREAM <- HTTP 200 OK")),
+        "{lines2:?}"
+    );
+}
+
 #[tokio::test]
 async fn chat_image_media_type_reaches_upstream_without_metadata() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
