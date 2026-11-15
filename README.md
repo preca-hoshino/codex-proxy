@@ -9,45 +9,32 @@ Codex Proxy 是一个使用 Rust 编写的个人多账号代理，将 Codex 上�
 - **账号管理**：支持 OAuth 登录、账号轮换、配额查询和失败重试。
 - **状态监控**：提供 `/healthz` 健康检查和请求、配额日志。
 
-代理会清理 Codex 不支持的请求参数，暂不支持 `previous_response_id`；流式响应开始后不会透明重试。
-
-Chat 和 Responses 请求支持 `prompt_cache_key`，默认自动生成，也可通过 `server.auto_prompt_cache = false` 关闭自动生成。缓存命中取决于账号、上游和相同的长输入前缀。
+代理会自动清理不支持的请求参数，支持图片及多模态工具消息，暂不支持 `previous_response_id`；流式响应开始后不会透明重试。`prompt_cache_key` 默认自动生成（可通过 `server.auto_prompt_cache = false` 关闭），命中取决于账号、上游与相同长输入前缀。
 
 ## 构建与运行
 
-### 依赖环境与编译
-
-需要安装 Rust 和 Cargo。编译并运行测试：
+需要安装 Rust 和 Cargo（Windows 也可从 [Releases](https://github.com/preca-hoshino/codex-proxy/releases) 下载 x64 或 ARM64 版本）：
 
 ```powershell
 cargo test --locked
 cargo build --release
 ```
 
-Windows 编译产物位于 `target\release\codex-proxy.exe`。也可从 [Releases](https://github.com/preca-hoshino/codex-proxy/releases) 下载 Windows x64 或 ARM64 版本。
+Windows 编译产物位于 `target\release\codex-proxy.exe`。
 
-### 账号配置
+### 账号配置与启动
 
 ```powershell
+# 添加并查看账号（管理账号或编辑账号文件前应先停止代理）
 .\target\release\codex-proxy.exe account add --oauth
 .\target\release\codex-proxy.exe account list
-```
 
-也可使用 `account import "$env:USERPROFILE\.codex\auth.json"` 导入已有登录。导入会复制刷新凭据，两个程序分别刷新可能导致原登录失效；独立授权更安全。
-
-账号文件为明文 JSON，包含访问令牌和刷新令牌，请妥善保管。账号管理命令和手动编辑账号文件前，应先停止代理。
-
-### 启动服务
-
-```powershell
-# 默认监听 127.0.0.1:8318
+# 启动服务（默认监听 127.0.0.1:8318，也可指定 --upstream-transport http）
 .\target\release\codex-proxy.exe serve
-
-# 使用 HTTP SSE 连接上游
-.\target\release\codex-proxy.exe serve --upstream-transport http
 ```
 
-客户端 Base URL 为 `http://127.0.0.1:8318/v1`。非回环监听必须配置 `server.api_key`，客户端通过 Bearer Token 认证。
+- 也可通过 `account import "$env:USERPROFILE\.codex\auth.json"` 导入已有登录；共享刷新凭据可能导致原登录失效，独立授权更安全。
+- 账号文件为明文 JSON（含访问与刷新令牌），请妥善保管；客户端 Base URL 为 `http://127.0.0.1:8318/v1`，非回环监听必须配置 `server.api_key`（Bearer Token 认证）。
 
 ### 命令行工具
 
@@ -59,11 +46,13 @@ Windows 编译产物位于 `target\release\codex-proxy.exe`。也可从 [Release
 | `config` | 查看、检查或修改配置 |
 | `test --model <MODEL> --stream` | 发送真实请求测试，消耗账号额度 |
 
-运行程序或子命令并附加 `--help` 可查看选项。
+附加 `--help` 可查看完整参数。
 
 ## 配置
 
-默认读取当前目录的 `config.toml`，文件不存在时使用内置默认值。配置项见 [config.example.toml](config.example.toml)，修改后需重启服务。排查请求清理或连接问题时，可设置 `RUST_LOG=info,codex_proxy=debug,proxy=debug` 启用调试日志。
+默认读取当前目录的 `config.toml`（不存在时使用内置默认值），配置项见 [config.example.toml](config.example.toml)，修改后需重启服务。
+
+日志级别可通过 `server.log_level`（默认 `info`）、全局参数 `--log-level` 或环境变量 `RUST_LOG` 控制；设置为 `debug` 时会输出上下游报文日志（`wire`），可通过 `server.log_redact_secrets = true`（默认 `false`）对凭据脱敏。
 
 ## 致谢
 
