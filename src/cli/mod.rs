@@ -11,6 +11,9 @@ pub struct Cli {
     /// Path to the configuration file
     #[arg(short = 'c', long, default_value = "config.toml", global = true)]
     pub config: PathBuf,
+    /// Override the configured log level (error, warn, info, debug, trace)
+    #[arg(long, global = true, value_parser = ["error", "warn", "info", "debug", "trace"])]
+    pub log_level: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -30,6 +33,9 @@ pub enum Command {
         /// Override the upstream transport (wss or http)
         #[arg(long, value_parser = ["wss", "http"])]
         upstream_transport: Option<String>,
+        /// Override whether secrets are redacted in debug wire logs (true or false)
+        #[arg(long)]
+        log_redact_secrets: Option<bool>,
     },
     /// Manage local accounts (stop a running instance first)
     Account {

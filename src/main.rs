@@ -50,7 +50,7 @@ fn upstream_http_client(config: &config::AppConfig) -> Result<reqwest::Client> {
     Ok(http_client_builder(config)?.build()?)
 }
 
-async fn oauth(client: &reqwest::Client) -> Result<serde_json::Value> {
+async fn oauth(client: &reqwest::Client, redact_secrets: bool) -> Result<serde_json::Value> {
     let (url, state, verifier) = upstream::auth_url();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:1455")
         .await
@@ -82,16 +82,19 @@ async fn oauth(client: &reqwest::Client) -> Result<serde_json::Value> {
         .get("code")
         .context("authorization returned no code")?;
     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: 29\r\n\r\nLogin received. Close window.").await?;
-    upstream::exchange_code(client, code, &verifier)
+    upstream::exchange_code(client, code, &verifier, redact_secrets)
         .await
         .map_err(anyhow::Error::msg)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    logger::init_logger();
     let cli = Cli::parse();
     if cli.command.is_none() {
+        logger::init_logger(
+            cli.log_level.as_deref().unwrap_or("info"),
+            cli.log_level.is_some(),
+        );
         Cli::command().print_help()?;
         println!();
         return Ok(());
@@ -103,11 +106,16 @@ async fn main() -> Result<()> {
         _ => cli.config.clone(),
     };
     let mut loaded = config::AppConfig::load(&config_path)?;
+    let cli_log_override = cli.log_level.is_some();
+    if let Some(level) = &cli.log_level {
+        loaded.server.log_level = level.clone();
+    }
     if let Some(Command::Serve {
         host,
         port,
         accounts,
         upstream_transport,
+        log_redact_secrets,
     }) = &cli.command
     {
         if let Some(host) = host {
@@ -122,8 +130,14 @@ async fn main() -> Result<()> {
         if let Some(transport) = upstream_transport {
             loaded.server.upstream_transport = transport.clone();
         }
+        if let Some(redact) = log_redact_secrets {
+            loaded.server.log_redact_secrets = *redact;
+        }
+        loaded.validate()?;
+    } else {
         loaded.validate()?;
     }
+    logger::init_logger(&loaded.server.log_level, cli_log_override);
     match &cli.command {
         Some(Command::Account {
             file: Some(path), ..
@@ -194,10 +208,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let client = http_client(&config)?;
-    let accounts = account::AccountManager::open(
+    let accounts = account::AccountManager::open_with_redaction(
         config.server.accounts_file.clone(),
         client.clone(),
         config.rotation.strategy.clone(),
+        config.server.log_redact_secrets,
     )?;
     match cli.command {
         Some(Command::Account { action, .. }) => {
@@ -216,11 +231,11 @@ async fn main() -> Result<()> {
                 } => {
                     let value = if let Some(token) = token {
                         eprintln!("Warning: command-line tokens can be visible to other processes; browser OAuth is preferred.");
-                        upstream::refresh(&client, &token)
+                        upstream::refresh(&client, &token, config.server.log_redact_secrets)
                             .await
                             .map_err(anyhow::Error::msg)?
                     } else if use_oauth {
-                        oauth(&client).await?
+                        oauth(&client, config.server.log_redact_secrets).await?
                     } else {
                         anyhow::bail!("specify --oauth or --token")
                     };
@@ -228,7 +243,7 @@ async fn main() -> Result<()> {
                     println!("Account added");
                 }
                 AccountCommand::Login => {
-                    let value = oauth(&client).await?;
+                    let value = oauth(&client, config.server.log_redact_secrets).await?;
                     accounts.add_token_response(&value).await?;
                     println!("Account added");
                 }

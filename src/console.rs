@@ -98,6 +98,12 @@ pub fn startup(config: &AppConfig, config_path: &Path, address: SocketAddr) -> S
     let _ = writeln!(
         output,
         "  {} {}",
+        "• Log Level:           ".bright_yellow(),
+        safe_text(&config.server.log_level.to_uppercase()).cyan()
+    );
+    let _ = writeln!(
+        output,
+        "  {} {}",
         "• Local Authentication:".bright_yellow(),
         if config
             .server
