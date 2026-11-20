@@ -30,6 +30,25 @@ pub struct AppState {
     pub logs: broadcast::Sender<String>,
 }
 
+impl AppState {
+    pub fn refresh_account_quota_now(&self, account_id: String) {
+        let accounts = self.accounts.clone();
+        let logs = self.logs.clone();
+        tokio::spawn(async move {
+            match accounts.refresh(Some(&account_id)).await {
+                Ok(()) => {
+                    if let Some(view) = accounts.account_view(&account_id).await {
+                        let _ = logs.send(console::quota_summary(&view));
+                    }
+                }
+                Err(err) => {
+                    let _ = logs.send(format!("Quota refresh: {err}"));
+                }
+            }
+        });
+    }
+}
+
 fn http_client_builder(config: &config::AppConfig) -> Result<reqwest::ClientBuilder> {
     let mut builder = reqwest::Client::builder().no_proxy();
     if let Some(proxy) = &config.server.proxy {

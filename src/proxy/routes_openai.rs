@@ -1,4 +1,5 @@
 use crate::{
+    account::Account,
     proxy::{metrics::RequestMetrics, stream::ChatConverter},
     upstream::transform::chat_to_responses,
     AppState,
@@ -308,7 +309,7 @@ async fn open_upstream(
     s: &AppState,
     body: Value,
     wire_id: u64,
-) -> Result<(crate::upstream::http::UpstreamEvents, Vec<String>), UpstreamOpenError> {
+) -> Result<(crate::upstream::http::UpstreamEvents, Vec<String>, Account), UpstreamOpenError> {
     let mut tried = Vec::new();
     let timeout = Duration::from_millis(s.config.retry.timeout_ms);
     for attempt_number in 1..=s.config.retry.max_attempts {
@@ -423,6 +424,7 @@ async fn open_upstream(
         let mut ws = match attempt {
             Ok(Ok(ws)) => ws,
             Ok(Err((Some(401 | 403 | 429), _))) => {
+                s.refresh_account_quota_now(a.id.clone());
                 let _ = s
                     .accounts
                     .cooldown(&a.id, s.config.rotation.cooldown_ms.div_ceil(1000))
@@ -438,7 +440,10 @@ async fn open_upstream(
                     message,
                 });
             }
-            _ => return Err("Upstream connection failed".into()),
+            _ => {
+                s.refresh_account_quota_now(a.id.clone());
+                return Err("Upstream connection failed".into());
+            }
         };
         let first = tokio::time::timeout(timeout, async {
             let mut buffered = Vec::new();
@@ -472,10 +477,20 @@ async fn open_upstream(
                 }
             }
         })
-        .await
-        .map_err(|_| "upstream response timed out".to_string())?
-        .map_err(str::to_string)?;
-        if account_failure(&first.1) {
+        .await;
+        let (buffered, first_event) = match first {
+            Ok(Ok(first)) => first,
+            Ok(Err(err)) => {
+                s.refresh_account_quota_now(a.id.clone());
+                return Err(err.into());
+            }
+            Err(_) => {
+                s.refresh_account_quota_now(a.id.clone());
+                return Err("upstream response timed out".into());
+            }
+        };
+        if account_failure(&first_event) {
+            s.refresh_account_quota_now(a.id.clone());
             let _ = s
                 .accounts
                 .cooldown(&a.id, s.config.rotation.cooldown_ms.div_ceil(1000))
@@ -485,7 +500,7 @@ async fn open_upstream(
                 .send("Upstream rejected an account; trying another".into());
             continue;
         }
-        if let Some(message) = client_request_failure(&first.1) {
+        if let Some(message) = client_request_failure(&first_event) {
             // Reject before committing HTTP/SSE headers. A request error is
             // terminal and says nothing about this account's health.
             return Err(UpstreamOpenError {
@@ -494,13 +509,14 @@ async fn open_upstream(
             });
         }
         if matches!(
-            first.1.get("type").and_then(Value::as_str),
+            first_event.get("type").and_then(Value::as_str),
             Some("error" | "response.failed")
         ) {
+            s.refresh_account_quota_now(a.id.clone());
             return Err("Upstream response failed".into());
         }
         tracing::debug!(target: "proxy", "Connected upstream");
-        return Ok((ws, first.0));
+        return Ok((ws, buffered, a));
     }
     Err("No account could connect to the Codex upstream".into())
 }
@@ -547,7 +563,7 @@ pub(super) async fn chat(
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (ws, buffered) = match open_upstream(&s, upstream_body, wire_id).await {
+    let (ws, buffered, account) = match open_upstream(&s, upstream_body, wire_id).await {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(target: "proxy", route = "chat", status = %e.status, "Upstream request could not start; token usage may be unavailable");
@@ -557,17 +573,53 @@ pub(super) async fn chat(
     let ws = futures_util::stream::iter(buffered.into_iter().map(Message::text).map(Ok)).chain(ws);
     let timeout = Duration::from_millis(s.config.retry.timeout_ms);
     if streaming {
+        let state_clone = s.clone();
+        let account_id = account.id.clone();
         let stream = async_stream::stream! {
-            let mut ws=ws; let mut converter=ChatConverter::new(model,include_usage); let mut request_log=request_log;
+            let mut ws = ws;
+            let mut converter = ChatConverter::new(model, include_usage);
+            let mut request_log = request_log;
+            let mut completed = false;
             loop {
-                let next=tokio::time::timeout(timeout,ws.next()).await;
-                let text=match next { Ok(Some(Ok(Message::Text(t))))=>t, Ok(Some(Ok(Message::Ping(_))))|Ok(Some(Ok(Message::Pong(_))))=>continue, _=>{let e=json!({"error":{"message":"upstream stream interrupted","type":"upstream_error"}}); yield Ok::<Bytes,Infallible>(Bytes::from(format!("data: {e}\n\n"))); break;} };
-                let event:Value=match serde_json::from_str(&text){Ok(v)=>v,Err(_)=>{let e=json!({"error":{"message":"invalid upstream event","type":"upstream_error"}});yield Ok(Bytes::from(format!("data: {e}\n\n")));break;}};
-                if gateway_metadata(&event) {continue;}
+                let next = tokio::time::timeout(timeout, ws.next()).await;
+                let text = match next {
+                    Ok(Some(Ok(Message::Text(t)))) => t,
+                    Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+                    _ => {
+                        let e = json!({"error":{"message":"upstream stream interrupted","type":"upstream_error"}});
+                        yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {e}\n\n")));
+                        break;
+                    }
+                };
+                let event: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let e = json!({"error":{"message":"invalid upstream event","type":"upstream_error"}});
+                        yield Ok(Bytes::from(format!("data: {e}\n\n")));
+                        break;
+                    }
+                };
+                if gateway_metadata(&event) {
+                    continue;
+                }
                 request_log.observe(&event);
-                for chunk in converter.on_event(&event) { yield Ok(Bytes::from(format!("data: {chunk}\n\n"))); }
-                if let Some(e)=converter.failure(){request_log.fail();let e=json!({"error":{"message":e,"type":"upstream_error"}});yield Ok(Bytes::from(format!("data: {e}\n\n")));break;}
-                if converter.finished(){yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));break;}
+                for chunk in converter.on_event(&event) {
+                    yield Ok(Bytes::from(format!("data: {chunk}\n\n")));
+                }
+                if let Some(e) = converter.failure() {
+                    request_log.fail();
+                    let e = json!({"error":{"message":e,"type":"upstream_error"}});
+                    yield Ok(Bytes::from(format!("data: {e}\n\n")));
+                    break;
+                }
+                if converter.finished() {
+                    completed = true;
+                    yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+                    break;
+                }
+            }
+            if !completed {
+                state_clone.refresh_account_quota_now(account_id);
             }
         };
         return (
@@ -586,7 +638,10 @@ pub(super) async fn chat(
             Ok(Some(Ok(Message::Text(text)))) => {
                 let event: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(_) => return error(StatusCode::BAD_GATEWAY, "invalid upstream event"),
+                    Err(_) => {
+                        s.refresh_account_quota_now(account.id.clone());
+                        return error(StatusCode::BAD_GATEWAY, "invalid upstream event");
+                    }
                 };
                 if gateway_metadata(&event) {
                     continue;
@@ -595,6 +650,7 @@ pub(super) async fn chat(
                 converter.on_event(&event);
                 if let Some(e) = converter.failure() {
                     request_log.fail();
+                    s.refresh_account_quota_now(account.id.clone());
                     return error(StatusCode::BAD_GATEWAY, &e);
                 }
                 if converter.finished() {
@@ -602,13 +658,17 @@ pub(super) async fn chat(
                         Ok(v) => Json(v).into_response(),
                         Err(e) => {
                             request_log.fail();
+                            s.refresh_account_quota_now(account.id.clone());
                             error(StatusCode::BAD_GATEWAY, &e)
                         }
                     };
                 }
             }
             Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
-            _ => return error(StatusCode::BAD_GATEWAY, "upstream stream interrupted"),
+            _ => {
+                s.refresh_account_quota_now(account.id.clone());
+                return error(StatusCode::BAD_GATEWAY, "upstream stream interrupted");
+            }
         }
     }
 }
@@ -651,7 +711,7 @@ pub(super) async fn responses(
         Err(e) => return validation_error(&s, "responses", &e),
     };
     add_automatic_cache_key(&mut body, &headers, s.config.server.auto_prompt_cache);
-    let (ws, buffered) = match open_upstream(&s, body, wire_id).await {
+    let (ws, buffered, account) = match open_upstream(&s, body, wire_id).await {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(target: "proxy", route = "responses", status = %e.status, "Upstream request could not start; token usage may be unavailable");
@@ -661,16 +721,46 @@ pub(super) async fn responses(
     let ws = futures_util::stream::iter(buffered.into_iter().map(Message::text).map(Ok)).chain(ws);
     let timeout = Duration::from_millis(s.config.retry.timeout_ms);
     if streaming {
+        let state_clone = s.clone();
+        let account_id = account.id.clone();
         let stream = async_stream::stream! {
-            let mut ws=ws; let mut request_log=request_log;
-            loop { let text=match tokio::time::timeout(timeout,ws.next()).await {Ok(Some(Ok(Message::Text(t))))=>t,Ok(Some(Ok(Message::Ping(_))))|Ok(Some(Ok(Message::Pong(_))))=>continue,_=>{let e=json!({"type":"error","error":{"message":"upstream stream interrupted"}});yield Ok::<Bytes,Infallible>(Bytes::from(format!("event: error\ndata: {e}\n\n")));break;}};
-                let event:Value=match serde_json::from_str(&text){Ok(v)=>v,Err(_)=>{let e=json!({"type":"error","error":{"message":"invalid upstream event"}});yield Ok(Bytes::from(format!("event: error\ndata: {e}\n\n")));break;}};
-                let kind=event.get("type").and_then(Value::as_str).unwrap_or("message");
-                if gateway_metadata(&event) {continue;}
+            let mut ws = ws;
+            let mut request_log = request_log;
+            let mut completed = false;
+            loop {
+                let text = match tokio::time::timeout(timeout, ws.next()).await {
+                    Ok(Some(Ok(Message::Text(t)))) => t,
+                    Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+                    _ => {
+                        let e = json!({"type":"error","error":{"message":"upstream stream interrupted"}});
+                        yield Ok::<Bytes, Infallible>(Bytes::from(format!("event: error\ndata: {e}\n\n")));
+                        break;
+                    }
+                };
+                let event: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let e = json!({"type":"error","error":{"message":"invalid upstream event"}});
+                        yield Ok(Bytes::from(format!("event: error\ndata: {e}\n\n")));
+                        break;
+                    }
+                };
+                let kind = event.get("type").and_then(Value::as_str).unwrap_or("message");
+                if gateway_metadata(&event) {
+                    continue;
+                }
                 request_log.observe(&event);
-                let terminal = ["response.completed","response.failed","response.incomplete","error"].contains(&kind);
+                if kind == "response.completed" {
+                    completed = true;
+                }
+                let terminal = ["response.completed", "response.failed", "response.incomplete", "error"].contains(&kind);
                 yield Ok(Bytes::from(format!("event: {kind}\ndata: {event}\n\n")));
-                if terminal {break;}
+                if terminal {
+                    break;
+                }
+            }
+            if !completed {
+                state_clone.refresh_account_quota_now(account_id);
             }
         };
         return (
@@ -688,7 +778,10 @@ pub(super) async fn responses(
             Ok(Some(Ok(Message::Text(text)))) => {
                 let event: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(_) => return error(StatusCode::BAD_GATEWAY, "invalid upstream event"),
+                    Err(_) => {
+                        s.refresh_account_quota_now(account.id.clone());
+                        return error(StatusCode::BAD_GATEWAY, "invalid upstream event");
+                    }
                 };
                 if gateway_metadata(&event) {
                     continue;
@@ -698,6 +791,7 @@ pub(super) async fn responses(
                     Some("response.completed") | Some("response.incomplete") => {
                         let Some(response) = event.get("response").filter(|v| v.is_object()) else {
                             request_log.fail();
+                            s.refresh_account_quota_now(account.id.clone());
                             return error(
                                 StatusCode::BAD_GATEWAY,
                                 "upstream terminal event missing response",
@@ -706,13 +800,17 @@ pub(super) async fn responses(
                         return Json(response.clone()).into_response();
                     }
                     Some("response.failed") | Some("error") => {
-                        return error(StatusCode::BAD_GATEWAY, "upstream response failed")
+                        s.refresh_account_quota_now(account.id.clone());
+                        return error(StatusCode::BAD_GATEWAY, "upstream response failed");
                     }
                     _ => {}
                 }
             }
             Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
-            _ => return error(StatusCode::BAD_GATEWAY, "upstream stream interrupted"),
+            _ => {
+                s.refresh_account_quota_now(account.id.clone());
+                return error(StatusCode::BAD_GATEWAY, "upstream stream interrupted");
+            }
         }
     }
 }

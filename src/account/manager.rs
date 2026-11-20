@@ -1036,4 +1036,36 @@ mod tests {
         assert_eq!(view.unwrap().id, "one");
         assert!(manager.account_view("non-existent").await.is_none());
     }
+
+    #[tokio::test]
+    async fn refresh_account_quota_now_logs_status_on_failure_or_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+
+        let (logs, mut rx) = tokio::sync::broadcast::channel(16);
+        let state = Arc::new(crate::AppState {
+            accounts: manager,
+            config: Arc::new(crate::config::AppConfig::default()),
+            upstream_http_client: reqwest::Client::new(),
+            #[cfg(test)]
+            test_upstream_url: None,
+            logs,
+        });
+
+        state.refresh_account_quota_now("one".into());
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("did not timeout")
+            .expect("received message");
+        assert!(msg.starts_with("Quota refresh:") || msg.starts_with("[QUOTA]"), "unexpected log: {msg}");
+    }
 }
