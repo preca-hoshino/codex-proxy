@@ -137,6 +137,8 @@ pub struct AccountView {
     pub quota_secondary: Option<f64>,
     pub quota_primary_reset: Option<i64>,
     pub quota_secondary_reset: Option<i64>,
+    #[serde(skip)]
+    pub quota_five_hour_not_applicable: bool,
     pub last_used: i64,
 }
 

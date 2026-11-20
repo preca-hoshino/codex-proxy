@@ -35,6 +35,7 @@ Windows 编译产物位于 `target\release\codex-proxy.exe`。
 
 - 也可通过 `account import "$env:USERPROFILE\.codex\auth.json"` 导入已有登录；共享刷新凭据可能导致原登录失效，独立授权更安全。
 - 账号文件为明文 JSON（含访问与刷新令牌），请妥善保管；客户端 Base URL 为 `http://127.0.0.1:8318/v1`，非回环监听必须配置 `server.api_key`（Bearer Token 认证）。
+- 账号列表和配额日志显示 5 小时及每周剩余额度和重置时间；单个配额窗口默认按每周显示，5 小时额度不适用时显示 `-`，上游明确标识 5 小时窗口时除外。`account list --json` 保留原有字段：`quota` / `quota_primary_reset` 对应 5 小时，`quota_secondary` / `quota_secondary_reset` 对应每周。
 
 ### 命令行工具
 
@@ -48,11 +49,15 @@ Windows 编译产物位于 `target\release\codex-proxy.exe`。
 
 附加 `--help` 可查看完整参数。
 
+启动服务或运行 `models` 时，模型目录按模型信息合并并显示可用账号数量；不同账号的模型信息不同时分别显示。`models --json` 保留按账号分组的原始结果。
+
 ## 配置
 
 默认读取当前目录的 `config.toml`（不存在时使用内置默认值），配置项见 [config.example.toml](config.example.toml)，修改后需重启服务。
 
 日志级别可通过 `server.log_level`（默认 `info`）、全局参数 `--log-level` 或环境变量 `RUST_LOG` 控制；设置为 `debug` 时会输出上下游报文日志（`wire`），可通过 `server.log_redact_secrets = true`（默认 `false`）对凭据脱敏。
+
+终端日志使用颜色和斜体强调标签；重定向输出或设置 `NO_COLOR` 时不添加终端样式。
 
 ## 致谢
 

@@ -283,13 +283,14 @@ async fn main() -> Result<()> {
                 .collect();
             anyhow::ensure!(!list.is_empty(), "no matching enabled accounts");
             let mut results = Vec::new();
+            let mut catalogs = Vec::new();
             let mut successes = 0;
             for account in list {
                 match accounts.models_for_account(&account.id).await {
                     Ok(models) => {
                         successes += 1;
                         if !json {
-                            println!("{}", console::models_for_account(&account.email, &models));
+                            catalogs.push((account.email.clone(), models.clone()));
                         }
                         results.push(serde_json::json!({"email":account.email,"result":models}));
                     }
@@ -305,6 +306,8 @@ async fn main() -> Result<()> {
             }
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
+            } else if !catalogs.is_empty() {
+                println!("{}", console::models_for_accounts(&catalogs));
             }
             anyhow::ensure!(
                 successes > 0,
@@ -351,13 +354,11 @@ async fn main() -> Result<()> {
                                 "No accounts configured. Use 'account add --oauth' to add one."
                             );
                         }
+                        let mut catalogs = Vec::new();
                         for account in accounts.iter().filter(|a| a.status != "disabled") {
                             match background.accounts.models_for_account(&account.id).await {
                                 Ok(models) => {
-                                    println!(
-                                        "{}",
-                                        console::models_for_account(&account.email, &models)
-                                    );
+                                    catalogs.push((account.email.clone(), models));
                                 }
                                 Err(_) => {
                                     let name: String =
@@ -367,6 +368,9 @@ async fn main() -> Result<()> {
                                     ));
                                 }
                             }
+                        }
+                        if !catalogs.is_empty() {
+                            println!("{}", console::models_for_accounts(&catalogs));
                         }
                         initial = false;
                     }

@@ -1,8 +1,18 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fmt::{self, Write},
+    io::IsTerminal,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::broadcast;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    field::RecordFields,
+    fmt::{format::Writer, FormatFields},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    EnvFilter,
+};
 
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,12 +47,17 @@ pub fn init_logger(default_level: &str, cli_override: bool) {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_level(true)
-        .with_ansi(true)
+        .with_ansi(log_ansi_enabled())
+        .fmt_fields(LogFields)
         .compact();
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
         .init();
+}
+
+fn log_ansi_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 pub fn format_axum_headers(headers: &HeaderMap, redact_secrets: bool) -> String {
@@ -163,6 +178,151 @@ fn is_sensitive_json_key(key: &str) -> bool {
     )
 }
 
+fn sanitize_message(message: &str) -> String {
+    let mut safe = String::new();
+    for c in message.chars() {
+        match c {
+            '\x1b' | '\x07' | '\x08' | '\x0c' | '\x7f' => {
+                let _ = write!(safe, "\\x{:02x}", c as u32);
+            }
+            '\u{80}'..='\u{9f}' => {
+                let _ = write!(safe, "\\u{{{:x}}}", c as u32);
+            }
+            _ => safe.push(c),
+        }
+    }
+    safe
+}
+
+fn style_log_message(message: &str, ansi: bool) -> String {
+    if ansi && message.starts_with("Sending request to Codex upstream ") {
+        let mut styled = String::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut index = 0;
+        while index < message.len() {
+            let remaining = &message[index..];
+            if !quoted && (index == 0 || message.as_bytes()[index - 1] == b' ') {
+                if let Some(name) = [
+                    "model",
+                    "reasoning_effort",
+                    "account",
+                    "transport",
+                    "attempt",
+                    "max_attempts",
+                ]
+                .into_iter()
+                .find(|name| {
+                    remaining
+                        .strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with('='))
+                }) {
+                    let _ = write!(styled, "\x1b[3m{name}\x1b[0m\x1b[2m=\x1b[0m");
+                    index += name.len() + 1;
+                    continue;
+                }
+            }
+            let ch = remaining.chars().next().expect("index is within message");
+            styled.push(ch);
+            if quoted && escaped {
+                escaped = false;
+            } else if quoted && ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = !quoted;
+            }
+            index += ch.len_utf8();
+        }
+        return styled;
+    }
+    if !ansi
+        || !(message.starts_with("[QUOTA]")
+            || message.starts_with("[METRICS]")
+            || message.starts_with("[REJECTED]")
+            || message.starts_with("Quota refresh:"))
+    {
+        return message.to_owned();
+    }
+    let mut styled = String::new();
+    for (index, part) in message.split(" | ").enumerate() {
+        if index > 0 {
+            styled.push_str(" | ");
+        }
+        let (tag, rest) = if part.starts_with('[') {
+            part.find(']')
+                .map_or(("", part), |end| part.split_at(end + 1))
+        } else {
+            ("", part)
+        };
+        if !tag.is_empty() {
+            styled.push_str(&format!("\x1b[1;36m{tag}\x1b[0m"));
+        }
+        if let Some((label, value)) = rest.split_once(": ") {
+            styled.push_str(&format!("\x1b[3;36m{label}\x1b[0m: {value}"));
+        } else {
+            styled.push_str(rest);
+        }
+    }
+    styled
+}
+
+struct LogFields;
+
+struct LogVisitor<'a> {
+    writer: Writer<'a>,
+    result: fmt::Result,
+    empty: bool,
+}
+
+impl tracing::field::Visit for LogVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if self.result.is_err() {
+            return;
+        }
+        self.result = (|| {
+            if !self.empty {
+                write!(self.writer, " ")?;
+            }
+            self.empty = false;
+            if field.name() == "message" {
+                let message = sanitize_message(&format!("{value:?}"));
+                write!(
+                    self.writer,
+                    "{}",
+                    style_log_message(&message, self.writer.has_ansi_escapes())
+                )
+            } else {
+                let name = field.name().strip_prefix("r#").unwrap_or(field.name());
+                if self.writer.has_ansi_escapes() {
+                    write!(self.writer, "\x1b[3m{name}\x1b[0m\x1b[2m=\x1b[0m{value:?}")
+                } else {
+                    write!(self.writer, "{name}={value:?}")
+                }
+            }
+        })();
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.record_debug(field, &format_args!("{value}"));
+        } else {
+            self.record_debug(field, &value);
+        }
+    }
+}
+
+impl<'a> FormatFields<'a> for LogFields {
+    fn format_fields<R: RecordFields>(&self, writer: Writer<'a>, fields: R) -> fmt::Result {
+        let mut visitor = LogVisitor {
+            writer,
+            result: Ok(()),
+            empty: true,
+        };
+        fields.record(&mut visitor);
+        visitor.result
+    }
+}
+
 pub async fn forward(mut receiver: broadcast::Receiver<String>) {
     loop {
         match receiver.recv().await {
@@ -203,6 +363,137 @@ mod tests {
     use super::*;
     use axum::http::{header, HeaderValue};
     use serde_json::json;
+
+    #[derive(Clone)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn actual_formatter_emits_styles_and_sanitizes_untrusted_escapes() {
+        for ansi in [true, false] {
+            let output = Captured(Default::default());
+            let target = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || target.clone())
+                .with_ansi(ansi)
+                .without_time()
+                .fmt_fields(LogFields)
+                .compact()
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "quota", "[QUOTA] Account: user\x1b[31m | Status: ready");
+            });
+            let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(text.contains("user\\x1b[31m"), "{text:?}");
+            assert!(!text.contains("user\x1b[31m"), "{text:?}");
+            if ansi {
+                assert!(text.contains("\x1b[1;36m[QUOTA]\x1b[0m"), "{text:?}");
+                assert!(text.contains("\x1b[3;36m"), "{text:?}");
+            } else {
+                assert!(!text.contains('\x1b'), "{text:?}");
+                assert!(
+                    text.contains("[QUOTA] Account: user\\x1b[31m | Status: ready"),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structured_fields_use_italic_names_and_dim_equals() {
+        for ansi in [true, false] {
+            let output = Captured(Default::default());
+            let target = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || target.clone())
+                .with_ansi(ansi)
+                .without_time()
+                .fmt_fields(LogFields)
+                .compact()
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "proxy", model = %"gpt-test", attempts = 2, "Request sent");
+            });
+            let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            if ansi {
+                assert!(
+                    text.contains("\x1b[3mmodel\x1b[0m\x1b[2m=\x1b[0mgpt-test"),
+                    "{text:?}"
+                );
+                assert!(
+                    text.contains("\x1b[3mattempts\x1b[0m\x1b[2m=\x1b[0m2"),
+                    "{text:?}"
+                );
+            } else {
+                assert!(text.contains("model=gpt-test attempts=2"), "{text:?}");
+                assert!(!text.contains('\x1b'), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_request_message_styles_only_field_names() {
+        let message = "Sending request to Codex upstream model=\"gpt-test\" reasoning_effort=\"xhigh\" account=\"name model=literal\" transport=wss attempt=1 max_attempts=5";
+        for ansi in [true, false] {
+            let output = Captured(Default::default());
+            let target = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || target.clone())
+                .with_ansi(ansi)
+                .without_time()
+                .fmt_fields(LogFields)
+                .compact()
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "proxy", "{message}");
+            });
+            let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            if ansi {
+                for name in [
+                    "model",
+                    "reasoning_effort",
+                    "account",
+                    "transport",
+                    "attempt",
+                    "max_attempts",
+                ] {
+                    assert!(
+                        text.contains(&format!("\x1b[3m{name}\x1b[0m\x1b[2m=\x1b[0m")),
+                        "{text:?}"
+                    );
+                }
+                assert!(text.contains("name model=literal"), "{text:?}");
+            } else {
+                assert!(text.contains(message), "{text:?}");
+                assert!(!text.contains('\x1b'), "{text:?}");
+            }
+        }
+    }
+    #[test]
+    fn log_styling_preserves_message_and_plain_output() {
+        let message = "[QUOTA] Account: user | Status: ready | 5-hour: 99.0% (4h 45m), Weekly: 41.0% (2d 3h 7m)";
+        assert_eq!(style_log_message(message, false), message);
+        let styled = style_log_message(message, true);
+        assert!(styled.contains("\x1b[1;36m[QUOTA]\x1b[0m"));
+        assert!(styled.contains("\x1b[3;36m"));
+        assert_eq!(
+            styled
+                .replace("\x1b[1;36m", "")
+                .replace("\x1b[3;36m", "")
+                .replace("\x1b[0m", ""),
+            message
+        );
+    }
 
     #[test]
     fn logger_build_filter_enables_wire_and_proxy_debug_when_requested() {

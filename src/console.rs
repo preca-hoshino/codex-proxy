@@ -140,7 +140,10 @@ fn reset_remaining(value: Option<i64>) -> String {
     let Some(seconds) = value else {
         return "unknown".into();
     };
-    let remaining = seconds.saturating_sub(chrono::Utc::now().timestamp());
+    format_remaining(seconds.saturating_sub(chrono::Utc::now().timestamp()))
+}
+
+fn format_remaining(remaining: i64) -> String {
     if remaining <= 0 {
         return "ready".into();
     }
@@ -148,16 +151,12 @@ fn reset_remaining(value: Option<i64>) -> String {
     let hours = (remaining % 86400) / 3600;
     let minutes = (remaining % 3600) / 60;
     if days > 0 {
-        format!("{days}d{hours}h")
+        format!("{days}d {hours}h {minutes}m")
     } else if hours > 0 {
-        format!("{hours}h{minutes}m")
+        format!("{hours}h {minutes}m")
     } else {
         format!("{minutes}m")
     }
-}
-
-fn quota_reset(value: Option<i64>) -> String {
-    format!(" (reset {})", reset_remaining(value))
 }
 
 pub fn quota_summary(account: &AccountView) -> String {
@@ -165,11 +164,19 @@ pub fn quota_summary(account: &AccountView) -> String {
         "No quota data (unknown)".into()
     } else {
         format!(
-            "Codex (Primary: {}{}, Secondary: {}{})",
-            percent(account.quota),
-            quota_reset(account.quota_primary_reset),
+            "5-hour: {} ({}), Weekly: {} ({})",
+            if account.quota_five_hour_not_applicable {
+                "-".into()
+            } else {
+                percent(account.quota)
+            },
+            if account.quota_five_hour_not_applicable {
+                "-".into()
+            } else {
+                reset_remaining(account.quota_primary_reset)
+            },
             percent(account.quota_secondary),
-            quota_reset(account.quota_secondary_reset)
+            reset_remaining(account.quota_secondary_reset)
         )
     };
     format!(
@@ -191,9 +198,9 @@ pub fn accounts(accounts: &[AccountView]) -> String {
         Cell::new("Email").fg(Color::Cyan),
         Cell::new("Status").fg(Color::Green),
         Cell::new("Cool Down").fg(Color::Magenta),
-        Cell::new("Primary Left").fg(Color::Blue),
-        Cell::new("Secondary Left").fg(Color::Blue),
-        Cell::new("Reset (Primary / Secondary)").fg(Color::Yellow),
+        Cell::new("5-hour Left").fg(Color::Blue),
+        Cell::new("Weekly Left").fg(Color::Blue),
+        Cell::new("Reset (5-hour / Weekly)").fg(Color::Yellow),
     ]);
     let now = chrono::Utc::now().timestamp();
     for account in accounts {
@@ -211,11 +218,20 @@ pub fn accounts(accounts: &[AccountView]) -> String {
             Cell::new(safe_text(&account.email)),
             Cell::new(safe_text(&account.status)).fg(status_color),
             Cell::new(cooldown),
-            Cell::new(percent(account.quota)).fg(quota_color(account.quota)),
+            Cell::new(if account.quota_five_hour_not_applicable {
+                "-".into()
+            } else {
+                percent(account.quota)
+            })
+            .fg(quota_color(account.quota)),
             Cell::new(percent(account.quota_secondary)).fg(quota_color(account.quota_secondary)),
             Cell::new(format!(
                 "{} / {}",
-                reset_remaining(account.quota_primary_reset),
+                if account.quota_five_hour_not_applicable {
+                    "-".into()
+                } else {
+                    reset_remaining(account.quota_primary_reset)
+                },
                 reset_remaining(account.quota_secondary_reset)
             )),
         ]));
@@ -223,32 +239,89 @@ pub fn accounts(accounts: &[AccountView]) -> String {
     format!("{table}\n")
 }
 
-pub fn models_for_account(email: &str, value: &Value) -> String {
-    let Some(models) = value
-        .get("models")
-        .or_else(|| value.get("data"))
-        .and_then(Value::as_array)
-    else {
-        return "No upstream model catalog: response does not contain a model list.\n".into();
-    };
-    let models: Vec<_> = models
-        .iter()
-        .filter_map(|model| {
-            let slug = safe_text(model.get("slug").or_else(|| model.get("id"))?.as_str()?);
-            if slug.is_empty() {
-                return None;
-            }
-            Some((slug, model))
-        })
-        .collect();
+pub fn models_for_accounts(catalogs: &[(String, Value)]) -> String {
+    let mut rows: Vec<([String; 5], Vec<String>)> = Vec::new();
     let mut output = String::new();
+    for (email, value) in catalogs {
+        let Some(models) = value
+            .get("models")
+            .or_else(|| value.get("data"))
+            .and_then(Value::as_array)
+        else {
+            let _ = writeln!(
+                output,
+                "No upstream model catalog for {}: response does not contain a model list.",
+                safe_text(email)
+            );
+            continue;
+        };
+        for model in models {
+            let Some(slug) = model
+                .get("slug")
+                .or_else(|| model.get("id"))
+                .and_then(Value::as_str)
+                .map(safe_text)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let text = |key| {
+                model
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(safe_text)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "-".into())
+            };
+            let reasoning = model
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| {
+                            level
+                                .get("effort")
+                                .and_then(Value::as_str)
+                                .or_else(|| level.as_str())
+                        })
+                        .map(safe_text)
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "-".into());
+            let context = model
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into());
+            let fields = [
+                slug,
+                text("display_name"),
+                reasoning,
+                context,
+                text("visibility"),
+            ];
+            let account = safe_text(email);
+            if let Some((_, accounts)) = rows.iter_mut().find(|(existing, _)| *existing == fields) {
+                if !accounts.contains(&account) {
+                    accounts.push(account);
+                }
+            } else {
+                rows.push((fields, vec![account]));
+            }
+        }
+    }
+    if catalogs.is_empty() {
+        return output;
+    }
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "  {} {} ({} models)",
-        "📡 Upstream Available Models for".bright_cyan().bold(),
-        safe_text(email).bright_yellow(),
-        models.len().to_string().bright_green()
+        "  {}",
+        "📡 Upstream Available Models".bright_cyan().bold()
     );
     let mut table = table();
     table.set_header(vec![
@@ -256,50 +329,13 @@ pub fn models_for_account(email: &str, value: &Value) -> String {
         Cell::new("Display Name").fg(Color::White),
         Cell::new("Tiers").fg(Color::Blue),
         Cell::new("Context Window").fg(Color::Yellow),
-        Cell::new("Default Tier").fg(Color::Green),
         Cell::new("Visibility").fg(Color::Magenta),
+        Cell::new("Available Accounts").fg(Color::Green),
     ]);
-    for (slug, model) in models {
-        let text = |key| {
-            model
-                .get(key)
-                .and_then(Value::as_str)
-                .map(safe_text)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "-".into())
-        };
-        let reasoning = model
-            .get("supported_reasoning_levels")
-            .and_then(Value::as_array)
-            .map(|levels| {
-                levels
-                    .iter()
-                    .filter_map(|level| {
-                        level
-                            .get("effort")
-                            .and_then(Value::as_str)
-                            .or_else(|| level.as_str())
-                    })
-                    .map(safe_text)
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "-".into());
-        let context = model
-            .get("context_window")
-            .and_then(Value::as_u64)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".into());
-        table.add_row(Row::from(vec![
-            Cell::new(slug),
-            Cell::new(text("display_name")),
-            Cell::new(reasoning),
-            Cell::new(context),
-            Cell::new(text("default_reasoning_level")),
-            Cell::new(text("visibility")),
-        ]));
+    for (fields, accounts) in rows {
+        let mut cells: Vec<Cell> = fields.into_iter().map(Cell::new).collect();
+        cells.push(Cell::new(accounts.len()));
+        table.add_row(Row::from(cells));
     }
     let _ = writeln!(output, "{table}");
     output
@@ -336,30 +372,94 @@ mod tests {
             status: "ready".into(),
             cooldown_until: None,
             quota: Some(75.0),
-            quota_secondary: None,
-            quota_primary_reset: None,
+            quota_secondary: Some(40.0),
+            quota_primary_reset: Some(0),
             quota_secondary_reset: None,
+            quota_five_hour_not_applicable: false,
             last_used: 0,
         };
         let output = accounts(std::slice::from_ref(&account));
-        assert!(output.contains("Primary Left"));
+        assert!(output.contains("5-hour Left"));
+        assert!(output.contains("Weekly Left"));
+        assert!(output.contains("Reset (5-hour / Weekly)"));
         assert!(output.contains("75.0%"));
+        assert!(output.contains("40.0%"));
+        assert!(output.contains("ready / unknown"));
         assert!(output.contains('┌'));
-        assert!(quota_summary(&account)
-            .contains("Primary: 75.0% (reset unknown), Secondary: unknown (reset unknown)"));
+        assert!(quota_summary(&account).contains("5-hour: 75.0% (ready), Weekly: 40.0% (unknown)"));
+        let mut unknown = account;
+        unknown.quota = None;
+        unknown.quota_secondary = None;
+        assert!(quota_summary(&unknown).contains("No quota data (unknown)"));
+        unknown.quota_secondary = Some(12.0);
+        unknown.quota_five_hour_not_applicable = true;
+        assert!(quota_summary(&unknown).contains("5-hour: - (-), Weekly: 12.0% (unknown)"));
+        let output = accounts(&[unknown]);
+        assert!(output.contains("12.0%"));
+        assert!(output.contains("- / unknown"));
         assert!(accounts(&[]).contains("No accounts configured"));
     }
 
     #[test]
+    fn remaining_time_includes_spaced_minutes() {
+        assert_eq!(format_remaining(4 * 3600 + 45 * 60), "4h 45m");
+        assert_eq!(format_remaining(2 * 86400 + 3 * 3600 + 7 * 60), "2d 3h 7m");
+        assert_eq!(format_remaining(60), "1m");
+        assert_eq!(format_remaining(0), "ready");
+    }
+
+    #[test]
     fn models_handle_missing_and_filter_control_characters() {
-        assert!(models_for_account("-", &json!({})).contains("does not contain a model list"));
-        let output = models_for_account(
-            "user@example.test",
-            &json!({"models":[{"slug":"gpt-test\u{1b}[2J"}, {}, {"slug":""}]}),
-        );
-        assert!(output.contains("user@example.test (1 models)"));
+        assert!(models_for_accounts(&[("-".into(), json!({}))])
+            .contains("does not contain a model list"));
+        let output = models_for_accounts(&[(
+            "user@example.test".into(),
+            json!({"models":[{"slug":"gpt-test\u{1b}[2J"}, {}, {"slug":""}]}),
+        )]);
+        assert!(!output.contains("user@example.test"));
         assert!(output.contains("Model ID"));
         assert!(output.contains('┌'));
         assert_eq!(safe_text("gpt-test\u{1b}[2J"), "gpt-test[2J");
+    }
+
+    #[test]
+    fn models_merge_accounts_without_losing_different_metadata() {
+        let first =
+            json!({"models":[{"slug":"shared","context_window":100}, {"slug":"first-only"}]});
+        let second = json!({"data":[{"id":"shared","context_window":100}, {"slug":"shared","context_window":200}, {"slug":"second-only"}]});
+        let output = models_for_accounts(&[
+            ("one@example.test".into(), first),
+            ("two@example.test".into(), second),
+        ]);
+        assert!(output.contains("Available Accounts"));
+        assert!(!output.contains("Default Tier"));
+        assert!(!output.contains("@example.test"));
+        let shared: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("shared"))
+            .collect();
+        assert!(shared.iter().any(|line| line.contains("100")
+            && line
+                .split('┆')
+                .last()
+                .unwrap()
+                .trim()
+                .trim_end_matches('│')
+                .trim()
+                == "2"));
+        assert!(shared.iter().any(|line| line.contains("200")
+            && line
+                .split('┆')
+                .last()
+                .unwrap()
+                .trim()
+                .trim_end_matches('│')
+                .trim()
+                == "1"));
+        assert_eq!(output.matches("shared").count(), 2);
+        assert!(output.contains("first-only"));
+        assert!(output.contains("second-only"));
+        assert!(output.contains("100"));
+        assert!(output.contains("200"));
     }
 }

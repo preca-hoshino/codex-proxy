@@ -14,6 +14,114 @@ use tokio::sync::Mutex;
 
 use crate::upstream::profile;
 
+fn quota_windows(quota: Option<&Value>) -> (Option<&Value>, Option<&Value>, bool) {
+    let primary = quota
+        .and_then(|q| q.pointer("/rate_limit/primary_window"))
+        .filter(|v| v.is_object());
+    let secondary = quota
+        .and_then(|q| q.pointer("/rate_limit/secondary_window"))
+        .filter(|v| v.is_object());
+    match (primary, secondary) {
+        (Some(window), None) | (None, Some(window)) => {
+            if window.get("limit_window_seconds").and_then(Value::as_i64) == Some(5 * 60 * 60) {
+                (Some(window), None, false)
+            } else {
+                (None, Some(window), true)
+            }
+        }
+        (Some(primary), Some(secondary))
+            if primary.get("limit_window_seconds").and_then(Value::as_i64)
+                == Some(7 * 24 * 60 * 60)
+                && secondary
+                    .get("limit_window_seconds")
+                    .and_then(Value::as_i64)
+                    == Some(5 * 60 * 60) =>
+        {
+            (Some(secondary), Some(primary), false)
+        }
+        (primary, secondary) => (primary, secondary, false),
+    }
+}
+
+fn window_used_percent(window: &Value) -> Option<f64> {
+    window
+        .get("used_percent")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+}
+
+fn window_reset_at(window: &Value) -> Option<i64> {
+    window
+        .get("reset_at")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+}
+
+pub fn is_window_exhausted(window: &Value, now: i64) -> bool {
+    let Some(used) = window_used_percent(window) else {
+        return false;
+    };
+    if used >= 100.0 {
+        if let Some(reset_at) = window_reset_at(window) {
+            return now < reset_at;
+        }
+        return true;
+    }
+    false
+}
+
+pub fn is_account_quota_exhausted(account: &Account, now: i64) -> bool {
+    let (five_hour, weekly, quota_five_hour_not_applicable) =
+        quota_windows(account.quota.as_ref());
+    if !quota_five_hour_not_applicable {
+        if let Some(w) = five_hour {
+            if is_window_exhausted(w, now) {
+                return true;
+            }
+        }
+    }
+    if let Some(w) = weekly {
+        if is_window_exhausted(w, now) {
+            return true;
+        }
+    }
+    false
+}
+
+fn account_to_view(a: &Account, now: i64) -> AccountView {
+    let (five_hour, weekly, quota_five_hour_not_applicable) =
+        quota_windows(a.quota.as_ref());
+    AccountView {
+        id: a.id.clone(),
+        email: a.email.clone(),
+        status: if !a.enabled {
+            "disabled"
+        } else if a.cooldown_until.is_some_and(|t| t > now) {
+            "cooldown"
+        } else if a.expires_at.is_some_and(|t| t <= now) && a.refresh_token.is_none() {
+            "expired"
+        } else {
+            "ready"
+        }
+        .into(),
+        cooldown_until: a.cooldown_until,
+        quota: five_hour
+            .and_then(|q| q.get("used_percent"))
+            .and_then(Value::as_f64)
+            .map(|used| 100.0 - used),
+        quota_secondary: weekly
+            .and_then(|q| q.get("used_percent"))
+            .and_then(Value::as_f64)
+            .map(|used| 100.0 - used),
+        quota_primary_reset: five_hour
+            .and_then(|q| q.get("reset_at"))
+            .and_then(Value::as_i64),
+        quota_secondary_reset: weekly
+            .and_then(|q| q.get("reset_at"))
+            .and_then(Value::as_i64),
+        quota_five_hour_not_applicable,
+        last_used: a.last_used,
+    }
+}
+
 pub struct AccountManager {
     path: PathBuf,
     _lock: File,
@@ -131,50 +239,22 @@ impl AccountManager {
             .context("persist refreshed credentials")?;
         Ok(if updated.enabled { Some(updated) } else { None })
     }
+    pub async fn account_view(&self, id: &str) -> Option<AccountView> {
+        let now = Utc::now().timestamp();
+        self.accounts
+            .lock()
+            .await
+            .iter()
+            .find(|a| a.id == id || a.email == id)
+            .map(|a| account_to_view(a, now))
+    }
     pub async fn list(&self) -> Vec<AccountView> {
         let now = Utc::now().timestamp();
         self.accounts
             .lock()
             .await
             .iter()
-            .map(|a| AccountView {
-                id: a.id.clone(),
-                email: a.email.clone(),
-                status: if !a.enabled {
-                    "disabled"
-                } else if a.cooldown_until.is_some_and(|t| t > now) {
-                    "cooldown"
-                } else if a.expires_at.is_some_and(|t| t <= now) && a.refresh_token.is_none() {
-                    "expired"
-                } else {
-                    "ready"
-                }
-                .into(),
-                cooldown_until: a.cooldown_until,
-                quota: a
-                    .quota
-                    .as_ref()
-                    .and_then(|q| q.pointer("/rate_limit/primary_window/used_percent"))
-                    .and_then(Value::as_f64)
-                    .map(|used| 100.0 - used),
-                quota_secondary: a
-                    .quota
-                    .as_ref()
-                    .and_then(|q| q.pointer("/rate_limit/secondary_window/used_percent"))
-                    .and_then(Value::as_f64)
-                    .map(|used| 100.0 - used),
-                quota_primary_reset: a
-                    .quota
-                    .as_ref()
-                    .and_then(|q| q.pointer("/rate_limit/primary_window/reset_at"))
-                    .and_then(Value::as_i64),
-                quota_secondary_reset: a
-                    .quota
-                    .as_ref()
-                    .and_then(|q| q.pointer("/rate_limit/secondary_window/reset_at"))
-                    .and_then(Value::as_i64),
-                last_used: a.last_used,
-            })
+            .map(|a| account_to_view(a, now))
             .collect()
     }
     pub async fn add_token_response(&self, value: &Value) -> Result<()> {
@@ -282,7 +362,10 @@ impl AccountManager {
             .await
             .iter()
             .filter(|a| {
-                a.enabled && !tried.contains(&a.id) && a.cooldown_until.is_none_or(|t| t <= now)
+                a.enabled
+                    && !tried.contains(&a.id)
+                    && a.cooldown_until.is_none_or(|t| t <= now)
+                    && !is_account_quota_exhausted(a, now)
             })
             .cloned()
             .collect();
@@ -310,7 +393,10 @@ impl AccountManager {
             }
             let mut accounts = self.accounts.lock().await;
             let Some(acc) = accounts.iter_mut().find(|a| {
-                a.id == candidate.id && a.enabled && a.cooldown_until.is_none_or(|t| t <= now)
+                a.id == candidate.id
+                    && a.enabled
+                    && a.cooldown_until.is_none_or(|t| t <= now)
+                    && !is_account_quota_exhausted(a, now)
             }) else {
                 continue;
             };
@@ -606,6 +692,101 @@ fn resolve_catalog_reasoning(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn disabled_account_never_sends_refresh_or_selection_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let client = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            AccountManager::open(dir.path().join("accounts.json"), client, "priority".into())
+                .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({
+                "account_id": "one", "access_token": "first", "refresh_token": "refresh"
+            }))
+            .await
+            .unwrap();
+        manager.accounts.lock().await[0].expires_at = Some(0);
+        manager.set_enabled("one", false).await.unwrap();
+
+        manager.refresh_all().await.unwrap();
+        assert!(manager.models_for_account("one").await.is_err());
+        assert!(manager.select(&[]).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_maps_quota_windows_and_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+        manager.accounts.lock().await[0].quota = Some(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 25, "reset_at": 100},
+                "secondary_window": {"used_percent": 60, "reset_at": 200}
+            }
+        }));
+        let accounts = manager.list().await;
+        assert_eq!(accounts[0].quota, Some(75.0));
+        assert_eq!(accounts[0].quota_secondary, Some(40.0));
+        assert_eq!(accounts[0].quota_primary_reset, Some(100));
+        assert_eq!(accounts[0].quota_secondary_reset, Some(200));
+    }
+
+    #[tokio::test]
+    async fn list_distinguishes_single_weekly_and_five_hour_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+        for window in [
+            serde_json::json!({"used_percent":88,"reset_at":123}),
+            serde_json::json!({"used_percent":88,"reset_at":123,"limit_window_seconds":604800}),
+        ] {
+            manager.accounts.lock().await[0].quota = Some(
+                serde_json::json!({"rate_limit":{"primary_window":window,"secondary_window":null}}),
+            );
+            let account = &manager.list().await[0];
+            assert_eq!(account.quota, None);
+            assert_eq!(account.quota_secondary, Some(12.0));
+            assert_eq!(account.quota_secondary_reset, Some(123));
+            assert!(account.quota_five_hour_not_applicable);
+            assert!(!serde_json::to_value(account)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("quota_five_hour_not_applicable"));
+        }
+        manager.accounts.lock().await[0].quota = Some(
+            serde_json::json!({"rate_limit":{"primary_window":{"used_percent":25,"reset_at":456,"limit_window_seconds":18000}}}),
+        );
+        let account = &manager.list().await[0];
+        assert_eq!(account.quota, Some(75.0));
+        assert_eq!(account.quota_secondary, None);
+        assert!(!account.quota_five_hour_not_applicable);
+    }
+
     #[test]
     fn ultra_uses_model_override_before_supported_fallbacks() {
         use serde_json::json;
@@ -700,5 +881,159 @@ mod tests {
         assert!(manager.models_for_account("missing").await.is_err());
         assert!(manager.models_for_account("one").await.is_err());
         assert_eq!(manager.list().await[0].last_used, 0);
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_account_is_not_selected_while_status_remains_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"two","access_token":"second"}))
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        // Account one: 5-hour quota used up (0% remaining), reset in future
+        manager.accounts.lock().await[0].quota = Some(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "reset_at": now + 3600,
+                    "limit_window_seconds": 18000
+                },
+                "secondary_window": {
+                    "used_percent": 30.0,
+                    "reset_at": now + 86400,
+                    "limit_window_seconds": 604800
+                }
+            }
+        }));
+        // Account two: quota normal (remaining > 0)
+        manager.accounts.lock().await[1].quota = Some(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 40.0,
+                    "reset_at": now + 3600,
+                    "limit_window_seconds": 18000
+                }
+            }
+        }));
+
+        // Account one's status remains "ready" (status preserved)
+        let list = manager.list().await;
+        assert_eq!(list[0].status, "ready");
+        assert_eq!(list[0].quota, Some(0.0));
+        assert_eq!(list[1].status, "ready");
+
+        // Selecting picks account two, not account one!
+        let selected = manager.select(&[]).await.unwrap();
+        assert_eq!(selected.id, "two");
+
+        // Now exhaust account two as well
+        manager.accounts.lock().await[1].quota = Some(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "reset_at": now + 3600,
+                    "limit_window_seconds": 18000
+                }
+            }
+        }));
+        // Both statuses remain "ready"
+        let list = manager.list().await;
+        assert_eq!(list[0].status, "ready");
+        assert_eq!(list[1].status, "ready");
+        // But select fails because both accounts are quota exhausted!
+        assert!(manager.select(&[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_without_five_hour_window_checks_weekly() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        // Only weekly window, 100% used (0% remaining)
+        manager.accounts.lock().await[0].quota = Some(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "reset_at": now + 3600,
+                    "limit_window_seconds": 604800
+                }
+            }
+        }));
+
+        assert!(is_account_quota_exhausted(&manager.accounts.lock().await[0], now));
+        assert!(manager.select(&[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_reset_at_in_the_past_is_not_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        // 100% used, but reset_at is in the past (already reset!)
+        manager.accounts.lock().await[0].quota = Some(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "reset_at": now - 60,
+                    "limit_window_seconds": 18000
+                }
+            }
+        }));
+
+        assert!(!is_account_quota_exhausted(&manager.accounts.lock().await[0], now));
+        let selected = manager.select(&[]).await.unwrap();
+        assert_eq!(selected.id, "one");
+    }
+
+    #[tokio::test]
+    async fn account_view_returns_single_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AccountManager::open(
+            dir.path().join("accounts.json"),
+            reqwest::Client::new(),
+            "priority".into(),
+        )
+        .unwrap();
+        manager
+            .add_token_response(&serde_json::json!({"account_id":"one","access_token":"first"}))
+            .await
+            .unwrap();
+
+        let view = manager.account_view("one").await;
+        assert!(view.is_some());
+        assert_eq!(view.unwrap().id, "one");
+        assert!(manager.account_view("non-existent").await.is_none());
     }
 }
