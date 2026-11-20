@@ -53,6 +53,10 @@ jobs:
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER || 'root' }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_JUMP_HOST: ${{ secrets.DEPLOY_JUMP_HOST }}
+          DEPLOY_JUMP_USER: ${{ secrets.DEPLOY_JUMP_USER || 'root' }}
+          DEPLOY_JUMP_PORT: ${{ secrets.DEPLOY_JUMP_PORT || '22' }}
+          DEPLOY_JUMP_KEY: ${{ secrets.DEPLOY_JUMP_KEY }}
           DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/codex-proxy' }}
           DEPLOY_SERVICE_NAME: ${{ vars.DEPLOY_SERVICE_NAME || 'codex-proxy.service' }}
           DEPLOY_HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL || 'http://127.0.0.1:8318/healthz' }}
@@ -61,9 +65,21 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-          SSH_OPTS="-i ~/.ssh/deploy_key -o ServerAliveInterval=15 -o ServerAliveCountMax=6"
+          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=6"
+
+          if [ -n "${DEPLOY_JUMP_HOST:-}" ]; then
+            if [ -n "${DEPLOY_JUMP_KEY:-}" ]; then
+              printf '%s\n' "$DEPLOY_JUMP_KEY" > ~/.ssh/jump_key
+              chmod 600 ~/.ssh/jump_key
+              JUMP_OPT="-o ProxyJump=${DEPLOY_JUMP_USER}@${DEPLOY_JUMP_HOST}:${DEPLOY_JUMP_PORT} -o IdentityFile=~/.ssh/jump_key"
+            else
+              JUMP_OPT="-o ProxyJump=${DEPLOY_JUMP_USER}@${DEPLOY_JUMP_HOST}:${DEPLOY_JUMP_PORT}"
+            fi
+            SSH_OPTS="${SSH_OPTS} ${JUMP_OPT}"
+            ssh-keyscan -p "$DEPLOY_JUMP_PORT" -H "$DEPLOY_JUMP_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          fi
           ssh ${SSH_OPTS} -p "$DEPLOY_PORT" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p '${DEPLOY_DIR}'"
 
           scp -C ${SSH_OPTS} -P "$DEPLOY_PORT" \
