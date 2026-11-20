@@ -441,7 +441,7 @@ mod tests {
         assert!(shared.iter().any(|line| line.contains("100")
             && line
                 .split('┆')
-                .last()
+                .next_back()
                 .unwrap()
                 .trim()
                 .trim_end_matches('│')
@@ -450,7 +450,7 @@ mod tests {
         assert!(shared.iter().any(|line| line.contains("200")
             && line
                 .split('┆')
-                .last()
+                .next_back()
                 .unwrap()
                 .trim()
                 .trim_end_matches('│')

@@ -44,15 +44,17 @@ fn quota_windows(quota: Option<&Value>) -> (Option<&Value>, Option<&Value>, bool
 }
 
 fn window_used_percent(window: &Value) -> Option<f64> {
-    window
-        .get("used_percent")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    window.get("used_percent").and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
 }
 
 fn window_reset_at(window: &Value) -> Option<i64> {
-    window
-        .get("reset_at")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    window.get("reset_at").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
 }
 
 pub fn is_window_exhausted(window: &Value, now: i64) -> bool {
@@ -69,8 +71,7 @@ pub fn is_window_exhausted(window: &Value, now: i64) -> bool {
 }
 
 pub fn is_account_quota_exhausted(account: &Account, now: i64) -> bool {
-    let (five_hour, weekly, quota_five_hour_not_applicable) =
-        quota_windows(account.quota.as_ref());
+    let (five_hour, weekly, quota_five_hour_not_applicable) = quota_windows(account.quota.as_ref());
     if !quota_five_hour_not_applicable {
         if let Some(w) = five_hour {
             if is_window_exhausted(w, now) {
@@ -87,8 +88,7 @@ pub fn is_account_quota_exhausted(account: &Account, now: i64) -> bool {
 }
 
 fn account_to_view(a: &Account, now: i64) -> AccountView {
-    let (five_hour, weekly, quota_five_hour_not_applicable) =
-        quota_windows(a.quota.as_ref());
+    let (five_hour, weekly, quota_five_hour_not_applicable) = quota_windows(a.quota.as_ref());
     AccountView {
         id: a.id.clone(),
         email: a.email.clone(),
@@ -982,7 +982,10 @@ mod tests {
             }
         }));
 
-        assert!(is_account_quota_exhausted(&manager.accounts.lock().await[0], now));
+        assert!(is_account_quota_exhausted(
+            &manager.accounts.lock().await[0],
+            now
+        ));
         assert!(manager.select(&[]).await.is_err());
     }
 
@@ -1012,7 +1015,10 @@ mod tests {
             }
         }));
 
-        assert!(!is_account_quota_exhausted(&manager.accounts.lock().await[0], now));
+        assert!(!is_account_quota_exhausted(
+            &manager.accounts.lock().await[0],
+            now
+        ));
         let selected = manager.select(&[]).await.unwrap();
         assert_eq!(selected.id, "one");
     }
@@ -1066,6 +1072,9 @@ mod tests {
             .await
             .expect("did not timeout")
             .expect("received message");
-        assert!(msg.starts_with("Quota refresh:") || msg.starts_with("[QUOTA]"), "unexpected log: {msg}");
+        assert!(
+            msg.starts_with("Quota refresh:") || msg.starts_with("[QUOTA]"),
+            "unexpected log: {msg}"
+        );
     }
 }
