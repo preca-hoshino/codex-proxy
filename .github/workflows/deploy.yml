@@ -65,30 +65,52 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=6"
+          cat << 'EOF' > ~/.ssh/config
+Host *
+  StrictHostKeyChecking no
+  ServerAliveInterval 15
+  ServerAliveCountMax 6
+  TCPKeepAlive yes
+EOF
 
           if [ -n "${DEPLOY_JUMP_HOST:-}" ]; then
-            if [ -n "${DEPLOY_JUMP_KEY:-}" ]; then
-              printf '%s\n' "$DEPLOY_JUMP_KEY" > ~/.ssh/jump_key
-              chmod 600 ~/.ssh/jump_key
-              JUMP_OPT="-o ProxyJump=${DEPLOY_JUMP_USER}@${DEPLOY_JUMP_HOST}:${DEPLOY_JUMP_PORT} -o IdentityFile=~/.ssh/jump_key"
-            else
-              JUMP_OPT="-o ProxyJump=${DEPLOY_JUMP_USER}@${DEPLOY_JUMP_HOST}:${DEPLOY_JUMP_PORT}"
-            fi
-            SSH_OPTS="${SSH_OPTS} ${JUMP_OPT}"
-            ssh-keyscan -p "$DEPLOY_JUMP_PORT" -H "$DEPLOY_JUMP_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          fi
-          ssh ${SSH_OPTS} -p "$DEPLOY_PORT" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p '${DEPLOY_DIR}'"
+            printf '%s\n' "$DEPLOY_JUMP_KEY" > ~/.ssh/jump_key
+            chmod 600 ~/.ssh/jump_key
 
-          scp -C ${SSH_OPTS} -P "$DEPLOY_PORT" \
+            cat << EOF >> ~/.ssh/config
+Host jumphost
+  HostName ${DEPLOY_JUMP_HOST}
+  User ${DEPLOY_JUMP_USER}
+  Port ${DEPLOY_JUMP_PORT}
+  IdentityFile ~/.ssh/jump_key
+
+Host target
+  HostName ${DEPLOY_HOST}
+  User ${DEPLOY_USER}
+  Port ${DEPLOY_PORT}
+  IdentityFile ~/.ssh/deploy_key
+  ProxyJump jumphost
+EOF
+          else
+            cat << EOF >> ~/.ssh/config
+Host target
+  HostName ${DEPLOY_HOST}
+  User ${DEPLOY_USER}
+  Port ${DEPLOY_PORT}
+  IdentityFile ~/.ssh/deploy_key
+EOF
+          fi
+          chmod 600 ~/.ssh/config
+
+          ssh target "mkdir -p '${DEPLOY_DIR}'"
+
+          scp -C \
             "deploy_pkg/codex-proxy-${TARGET_OS}" \
             "deploy_pkg/config.example.toml" \
-            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}/"
+            "target:${DEPLOY_DIR}/"
 
-          ssh ${SSH_OPTS} -p "$DEPLOY_PORT" "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            bash -s -- "${DEPLOY_DIR}" "${TARGET_OS}" "${DEPLOY_SERVICE_NAME}" "${DEPLOY_HEALTH_URL}" << 'EOS'
+          ssh target bash -s -- "${DEPLOY_DIR}" "${TARGET_OS}" "${DEPLOY_SERVICE_NAME}" "${DEPLOY_HEALTH_URL}" << 'EOS'
             set -euo pipefail
             DEPLOY_DIR="$1"
             TARGET_OS="$2"
