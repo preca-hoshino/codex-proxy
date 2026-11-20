@@ -34,7 +34,7 @@ pub fn build_filter(level: &str) -> EnvFilter {
             "info,codex_proxy={level},wire={level},proxy={level},metrics={level},quota={level},profile={level}"
         ))
     } else {
-        EnvFilter::new(format!("{level},tower_http=info"))
+        EnvFilter::new(level)
     }
 }
 
